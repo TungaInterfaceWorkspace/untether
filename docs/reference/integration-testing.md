@@ -1,6 +1,6 @@
 # Integration Testing
 
-Structured, repeatable integration test process run against `@untether_dev_bot` before every release. Tests exercise all 4 supported engines across the full feature surface.
+Structured, repeatable integration test process run against `@untether_dev_bot` before every release. Tests exercise all 5 supported engines across the full feature surface.
 
 > **Deprecated engines are out of the matrix.** `gemini` and `amp` are deprecated
 > and no longer supported (they may be removed in a future release). Both are currently non-functional on the
@@ -16,9 +16,11 @@ Structured, repeatable integration test process run against `@untether_dev_bot` 
 | | Details |
 |---|---|
 | **Dev service** | `untether-dev.service` → `@untether_dev_bot` |
-| **Test projects** | `test-projects/test-{claude,codex,opencode,pi}/` (plus deprecated `test-{gemini,amp}/`) |
-| **Test chats** | 6 dedicated Telegram groups in the `ut-dev` folder, one per engine (2 deprecated) |
-| **Engines** | Claude, Codex, OpenCode, Pi (⚠️ Gemini, Amp — deprecated, opt-in only) |
+| **Test projects** | `test-projects/test-{claude,codex,opencode,pi,antigravity}/` (plus deprecated `test-{gemini,amp}/`) |
+| **Test chats** | 7 dedicated Telegram groups in the `ut-dev` folder, one per engine (2 deprecated) |
+| **Engines** | Claude, Codex, OpenCode, Pi, Antigravity (⚠️ Gemini, Amp — deprecated, opt-in only) |
+
+Antigravity (`agy`, [#558](https://github.com/littlebearapps/untether/issues/558)) joins the matrix with 0.36.1rc1. Of the five fleet hosts only lba-1 has `agy` installed, and its test project and test chat are set up as part of the 0.36.1rc1 run (see "0.36.1rc1 scenarios / results" at the end of this file).
 
 ## Automated Testing via Telegram MCP
 
@@ -32,7 +34,7 @@ All integration test tiers are fully automated by Claude Code using Telegram MCP
 
 ### Test chats
 
-Tests are sent to the 4 supported engine chats (plus 2 opt-in chats for the deprecated, unsupported Gemini and AMP engines) via `@untether_dev_bot` (bot ID `8678330610`).
+Tests are sent to the 5 supported engine chats (plus 2 opt-in chats for the deprecated, unsupported Gemini and AMP engines) via `@untether_dev_bot` (bot ID `8678330610`).
 For DM-only tests (commands, `/at`, `/cancel`), use Nathan's personal DM chat ID with the bot — **not** the bot ID itself. The bot ID identifies the bot account; private chats are addressed by the user's chat ID. Resolve via the Telegram MCP `resolve_username` or by inspecting incoming `update.message.from.id` in the dev logs.
 
 | Chat | Chat ID | Bot API chat_id |
@@ -41,6 +43,7 @@ For DM-only tests (commands, `/at`, `/cancel`), use Nathan's personal DM chat ID
 | Codex CLI | `4929463515` | `-4929463515` |
 | OpenCode | `5200822877` | `-5200822877` |
 | Pi | `5156256333` | `-5156256333` |
+| Antigravity CLI | `5540298446` | `-5540298446` |
 | Gemini CLI | `5207762142` | `-5207762142` |
 | AMP CLI | `5230875989` | `-5230875989` |
 
@@ -84,28 +87,41 @@ These tests were previously considered "manual" but can be automated via MCP and
 
 ## Engine Feature Matrix
 
-| Capability | Claude | Codex | OpenCode | Pi | Gemini ⚠️ | Amp ⚠️ |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Support status** | Yes | Yes | Yes | Yes | Deprecated | Deprecated |
-| Interactive approval | Yes | - | - | - | Flag only | - |
-| Plan mode | Yes | - | - | - | - | - |
-| Ask questions | Yes | - | - | - | - | - |
-| Resume/continue | Yes | Yes | Yes | Yes | Yes | Yes |
-| Model override | Yes | Yes | Yes | Yes | Yes | Yes |
-| Reasoning levels | Yes | Yes | - | - | - | - |
-| API cost tracking | Yes | - | Yes | - | Yes | Yes |
-| Subscription usage | Yes | - | - | - | - | - |
-| Diff preview | Yes | - | - | - | - | - |
+| Capability | Claude | Codex | OpenCode | Pi | Antigravity | Gemini ⚠️ | Amp ⚠️ |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Support status** | Yes | Yes | Yes | Yes | Yes | Deprecated | Deprecated |
+| Interactive approval | Yes | - | - | - | - (pre-run mode; gate in rc3) | Flag only | - |
+| Plan mode | Yes | - | - | - | rc3 (gate) | - | - |
+| Ask questions | Yes | - | - | - | - | - | - |
+| Resume/continue | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Model override | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Reasoning levels | Yes | Yes | - | - | Yes (per model) | - | - |
+| API cost tracking | Yes | - | Yes | - | - (tokens only) | Yes | Yes |
+| Subscription usage | Yes | - | - | - | Quota groups (`/usage`) | - | - |
+| Diff preview | Yes | - | - | - | - | - | - |
+
+Antigravity in 0.36.1rc1 has two permission modes, picked before the run: **Workspace** (the default: `agy`'s own
+`--mode=accept-edits`, so file edits inside the project and no shell) and **Full access** (explicit). **Ask me** and **Plan first** are shown as `· soon` and are refused before
+anything spawns until the approval gate ships in rc3. A blocked tool shows as a `⚠️ Blocked: …` progress row.
 
 ---
 
 ## Test Tiers
 
-### Tier 1: Universal Tests (all 4 supported engines)
+### Tier 1: Universal Tests (all 5 supported engines)
 
 Run in every supported engine's dedicated chat. Validates the core event pipeline.
 The deprecated `gemini` and `amp` chats are excluded — they cannot pass U1 and are
 not required at any tier.
+
+In the Antigravity chat the rows run in the default **Workspace** mode, which edits files inside the project and
+blocks shell commands. U7's read of a missing file needs no shell. U6 needs a prompt that runs long without a shell
+command (for example a 1500-word essay), because Workspace blocks shell loops.
+
+> **Antigravity in Workspace (0.36.1rc1):** Workspace runs use Untether's no-shell agent ([#1037](https://github.com/littlebearapps/untether/issues/1037)), so `agy`
+> answers with its file tools. **U4:** `agy` has no rename or delete file tool in this mode, so it copies the file to
+> the new name and leaves the original; that is the expected result. A conversation keeps the agent it started
+> with: after switching a chat between Workspace and Full access, send `/new` before the next row.
 
 | # | Test | What to send | What to verify | Catches |
 |---|------|-------------|----------------|---------|
@@ -116,7 +132,7 @@ not required at any tier.
 | U5 | **Model override** | `/model set <name>` (the `/config` → Engine & model page points there; it has no picker), then send a prompt; `/model clear` afterwards | Footer shows overridden model name | #77 (AMP model flag), build_args correctness |
 | U6 | **Cancel mid-run** | Send a long prompt (not a bare `sleep N` — Claude Code may block a standalone foreground sleep (`Blocked: standalone sleep 90` seen on rc18); use e.g. a `for i in $(seq 1 90); do sleep 1; done` loop), then `/cancel` before it finishes | Run stops, completion message appears, no orphan process | Graceful cancellation, process cleanup |
 | U7 | **Error handling** | Send a prompt that will fail (e.g. `read /nonexistent/file/path`) | Error renders in Telegram, no crash, session ends cleanly | Stderr sanitisation (#85), error formatting |
-| U8 | **/usage** | `/usage` after a completed run | Claude: subscription info; Codex/OpenCode/Pi: last-session token totals (`📊 <engine> · last session in this chat`, #417) | #89 (429 handling), cost tracking |
+| U8 | **/usage** | `/usage` after a completed run | Claude: subscription info; Codex/OpenCode/Pi: last-session token totals (`📊 <engine> · last session in this chat`, #417); Antigravity: per-group quota + last-session tokens | #89 (429 handling), cost tracking |
 | U9 | **/export** | `/export` after a completed run | A reply with an attached `untether-export-<engine>-<sid>-<stamp>.md` document captioned `📄 Session export — <engine> · N events · Markdown` / `Session: <id>` (`/export json` attaches a `.json`). The file has the session header, `**Usage:** … · last run` (`· thread total` for Codex), every action and the full, untruncated answers; it doesn't include the user prompts. Log: `command.attachment_sent command=export` | #63 (missing usage in export), #418 (file attachment) |
 | U10 | **/browse** | `/browse` | File browser appears with inline keyboard, can navigate directories | Browse command, path traversal safety |
 
@@ -161,7 +177,7 @@ Tests for per-chat and per-topic settings that affect run behaviour. Use forum t
 | # | Test | What to send | What to verify | Catches |
 |---|------|-------------|----------------|---------|
 | O1 | **Engine override** | `/agent set opencode`, then send a plain prompt (no directive) | OpenCode runs, footer shows OpenCode model | Per-chat engine default, override hierarchy |
-| O2 | **Reasoning level** | `/config` → Reasoning → pick a level (e.g. Low), then send a prompt (Claude and Codex only) | Reasoning model used, footer reflects it | Reasoning flag in build_args |
+| O2 | **Reasoning level** | `/config` → Reasoning → pick a level (e.g. Low), then send a prompt (Claude and Codex; Antigravity's page is **Effort**, with the levels its current model accepts) | Reasoning model used, footer reflects it | Reasoning flag in build_args |
 | O3 | **Listen mode** | `/listen mentions` in group, send plain text, then `@bot do something` | Plain text ignored, @mention triggers run | Listen mode filtering (renamed from `/trigger` in v0.35.3 [#297](https://github.com/littlebearapps/untether/issues/297); deprecated alias still works) |
 | O4 | **Ask mode toggle** | `/config` → ❓ Ask mode → off, send prompt that would trigger AskUserQuestion | Question auto-denied instead of shown | Ask mode auto-deny path |
 | O5 | **Context set** | `/ctx set test-claude main`, send prompt | Run uses test-claude project on main branch | Context resolution, project switching |
@@ -426,7 +442,7 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
    Claude Code sends each command to an engine chat via MCP, verifies responses
 
 5. Run Tier 1 (universal) — 30 minutes
-   Claude Code runs U1-U10 in the 4 supported engine chats via MCP
+   Claude Code runs U1-U10 in the 5 supported engine chats via MCP
    (skip the deprecated gemini/amp chats — they cannot pass U1)
    Focus on: progress rendering, final message, model footer, resume
 
@@ -472,7 +488,7 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
 | Release type | Required tiers | Focus areas | Time |
 |-------------|---------------|-------------|------|
 | **Patch** (bug fix) | Tier 7 + Tier 1 (affected engine + Claude) + relevant Tier 6 | The specific bug area + regression check | ~30 min |
-| **Minor** (new feature) | Tier 7 + Tier 1 (all 4 supported engines) + Tier 2 + Tier 3 (relevant) + Tier 4 (relevant) + Tier 6 + upgrade path | New feature + all engine regression + config compat | ~75 min |
+| **Minor** (new feature) | Tier 7 + Tier 1 (all 5 supported engines) + Tier 2 + Tier 3 (relevant) + Tier 4 (relevant) + Tier 6 + upgrade path | New feature + all engine regression + config compat | ~75 min |
 | **Major** (breaking) | All tiers, all supported engines, full upgrade path | Everything — no shortcuts | ~120 min |
 
 ### What to focus on per change type
@@ -480,6 +496,9 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
 | Changed area | Must-run tests |
 |---|---|
 | Runner code (`runners/*.py`) | U1-U4 (all supported engines), U6, U7 |
+| Antigravity engine (`runners/antigravity.py`, `schemas/antigravity.py`, `utils/antigravity_quota.py`) | Tier 1 (Antigravity) + AG-* |
+| Base runner / liveness watchdog / stall monitor (`runner.py` `JsonlSubprocessRunner`, `_subprocess_watchdog`; `runner_bridge.py` expected-wait branches) | Tier 1 U1 + U6 on every supported engine |
+| Preamble (`runner_bridge.py` `_apply_preamble`) | U1 + U2 + U6 on Codex, OpenCode and Pi; C1, C2, C4 on Claude (`preamble.applied preamble_len=3338` unchanged for Claude) |
 | Per-run stream binding (`runner.py` `RunStreamHandle` / `publish_run_stream`, `runner_bridge.py` stall monitor) | RC12-1, S1, S2, U1-U4 (all supported engines), B-LIVE-1 |
 | Claude stream schema / rate-limit / API-retry handling (`schemas/claude.py`, `runners/claude.py`) | `uv run pytest tests/test_claude_cli_schema_drift.py`, RC12-2, RC12-3, S1, R20-922a…c (usage-credits cap latch) |
 | Runner bridge / auto-continue / no-op resume recovery (`runner_bridge.py`, `runners/claude.py`) | B-RESUME, U1-U4 (Claude), U6, U7, R20-919a…d + R20-920a…e (approval reminders) |
@@ -605,7 +624,7 @@ When detected, note the engine, chat ID, message IDs, and exact behaviour. Creat
 - **Model override (U5)** availability depends on which models each engine supports. `/model` shows the current model; `/config` → Engine & model has no picker (an interactive picker is [#512](https://github.com/littlebearapps/untether/issues/512), planned for v0.36.2), so pass a model id to `/model set`.
 - **Long response (U3)** behaviour varies by engine — some produce shorter responses. The key check is message splitting, not word count.
 - **Concurrent sessions (S2)** may hit rate limits on some engine APIs. Space the prompts a few seconds apart.
-- **Reasoning levels (O2)** only available for Claude and Codex.
+- **Reasoning levels (O2)** only available for Claude, Codex and Antigravity (per model: `/config` → Effort).
 
 ### Config and state
 
@@ -1500,3 +1519,107 @@ Run on the dev bot by three parallel QA agents (one per set of chats) plus the c
 | Logs | PASS | No Traceback. Every warning and error is explained (placeholder startup `chat_id = 123`, a deliberate bad Pi model, the triggers `restart_required` notice, webhook port already bound by another instance, one benign `stdout_held_after_exit`); 11 FDs, 0 zombies |
 
 **Filed:** [#996](https://github.com/littlebearapps/untether/issues/996) (`/ctx` vs a live session), [#997](https://github.com/littlebearapps/untether/issues/997) (`/browse` ignores `/ctx`), [#998](https://github.com/littlebearapps/untether/issues/998) (`/model clear` keeps the resumed session's model).
+
+## 0.36.1rc1 scenarios / results (Antigravity, #558)
+
+0.36.1rc1 ("Safe core") adds the Antigravity CLI (`agy`) engine ([#558](https://github.com/littlebearapps/untether/issues/558)), with [#975](https://github.com/littlebearapps/untether/issues/975) (a result held for a background task is an expected wait), [#976](https://github.com/littlebearapps/untether/issues/976) (`agy_version` in the logs) and [#993](https://github.com/littlebearapps/untether/issues/993) (the About versions line). The same change touches the base runner, the liveness watchdog, the stall monitor, cron options and the preamble, so the run is the **Minor** tiers plus the AG rows below, with a regression pass on Claude, Codex, OpenCode and Pi.
+
+> **Status: FIVE RUNS ON THE BRANCH, ALL ROWS RUN; NOT YET ATTESTED.** Both blockers are fixed on the branch and verified live: Workspace could not write a file inside the project (run 1, fixed in `5283f71a`), and `agy` opened with a shell command that ended the turn on the blocked notice ([#1037](https://github.com/littlebearapps/untether/issues/1037), fixed by the no-shell Workspace agent, run 4). Run 5 (same day) completed the rows that were owed: AG-6, AG-8, AG-12c, AG-12d, X-1 (a one-shot Claude cron answered `OK`), the Upgrade path, S2b, Pi U1b/U2 and the log sweep. What remains is the release sequence: PR to `dev`, the rc bump, the smoke rows on merged `dev` and the marker. No attestation marker exists for 0.36.1rc1 and nothing has been rolled out. A row that was not run, or whose result was not seen, is recorded as such, never as a pass.
+
+- **When and what:** dev bot only (`@untether_dev_bot`), on `feature/558-antigravity`, signed in with a Google account. Run 1 `qa-20261010T0757Z` (2026-10-10 18:57–19:34 AEDT, at `46d3d9be`) covered most rows and ended before the remaining rows, the cleanup and the log sweep; 26 `agy` turns reached the account and the Gemini 5-hour group went from 0 % to 1 %. Run 2 `qa-20261011T0215Z` (2026-10-11 13:11–13:27, same code) ran Pi U1/U2/U6/U8, S2, S6, S8, T9 and O1. Run 3 `qa-20261011T0400Z` (2026-10-11 14:04–14:08, at `5283f71a`) re-ran AG-1, AG-2 and U4 on the Workspace fix, with two negative checks. Run 4 `qa-20261011T0401Z` (2026-10-11 15:01–15:18, on the #1037 working tree) re-ran AG-1/U1 five times, `Reply with exactly: OK` five times, S8, T9, O1, the negative checks and the Workspace → Full access switch. The remaining rows are run on the branch; the smoke rows are then repeated on the merged `dev` head for 0.36.1rc1, and the marker binds that SHA.
+- **Fixed on the branch (shell first, [#1037](https://github.com/littlebearapps/untether/issues/1037)):** on a new conversation `agy`'s default agent tended to start with a shell command (`ls -la`); Workspace blocked it and the turn ended with only the blocked-shell notice (AG-1 and U1 twice in run 3; S8, T9 and O1 in run 2). Direct probes showed Untether's preamble was one cause but not the only one, and that `agy` has no per-run system prompt or safe read-only allow list. Workspace runs now pass `--agent=untether-workspace`, an agent file Untether keeps in `~/.gemini/config/agents/` whose tool list has no shell, web, MCP or subagent tool. Run 4: AG-1/U1 5 of 5, `OK` 5 of 5, S8, T9 and O1 answered. `agy` keeps a conversation on the agent it started with, so after switching to Full access the user sends `/new` (the toast, the page and the reply say so).
+- **Fixed on the branch (Workspace file writes, `5283f71a`):** in run 1, with no permission flag, `agy` 1.3.3 in print mode blocked `WriteToFile` for a path inside the project (`antigravity.denied_actions actions=['write_file'] … permission_mode=workspace`). With no flag, headless `agy` allows file writes only in temp folders, and the earlier probes all ran under `/tmp`. Workspace runs now pass `agy`'s own `--mode=accept-edits`: edits inside the project go ahead; shell, web, MCP and files outside the project stay blocked; `init.permission_mode` still reports `request-review`. Run 3 verified it: AG-2 wrote the file inside the project, `git status` was still blocked and so was a write to an absolute path outside the project.
+- **CLIs:** `agy` 1.3.3 in all three runs. The drift suite is green on 1.3.3, but it still has no file-write check in a non-temp folder, so it would not have caught the Workspace write block. `agy` updates itself, so record `agy --version` at the start and end of every run. Baseline `preamble.applied preamble_len`: 3338 for Claude, 2574 for Codex, OpenCode, Pi and Antigravity.
+- **Marker:** `~/.untether-dev/integration-test-pass-0.36.1rc1.json`, not written.
+
+### Before the run
+
+- `test-projects/test-antigravity/` exists as a git repo with an `AGENTS.md` and a `hello.py`, and **no** `.agents/` folder.
+- The "ut-dev · Antigravity" group exists (Nathan + the dev bot), its ID is filled in under "Test chats" above, and the dev config binds it to the test project with `antigravity` as the engine. The dev bot has been restarted on the code under test from a normal shell, never from inside an Untether session.
+- The drift suite is green the same day: `UNTETHER_AGY_DRIFT=1 uv run pytest tests/test_antigravity_cli_schema_drift.py`.
+- `/usage` in the Antigravity chat first: pause if the 5-hour Gemini group is past 50 %. The run is about 40 short `agy` turns; record the auth route (API key or OAuth) and the turn count in the attestation notes.
+- **Config table name:** the dev config uses the nested `[engines.*]` layout, and once any `[engines.*]` table exists a flat `[antigravity]` table is ignored (see [Engine-specific config tables](config.md#engine-specific-config-tables)). Every TOML step below is therefore written as `[engines.antigravity]`; written flat, AG-5 would run instead of being refused and AG-9 would run signed in.
+- AG-12c and AG-12d fire test crons, so `[triggers] enabled` must be on in the dev config (turning it on needs a restart).
+- Log tail in a second shell: `journalctl --user -u untether-dev -f -o cat | grep -E "antigravity|runner\.(start|completed)|usage\.token_delta|preamble|subprocess\.(background_wait|liveness_stall)|ERROR|WARNING"`.
+
+### Required for 0.36.1rc1
+
+1. **Tier 7** Q1–Q16 in the Antigravity chat and one other chat. Q8 stays `/planmode show` in the Claude chat; also send `/planmode show` in the Antigravity chat, which answers with the `Use /config → Permission mode instead.` hint (AG-8).
+2. **Tier 1** U1–U10 in the Antigravity chat (Workspace mode; see the note under Tier 1) and in the Claude chat. **U1 + U2 + U6 on Codex, OpenCode and Pi**: the preamble is now built from each engine's capabilities, so the text those three receive has changed, and the base runner and stall monitor changed under all of them.
+3. **Tier 2** C1, C2 and C4 in the Claude chat. Claude's preamble must be byte-identical: `preamble.applied preamble_len=3338 source=default` on a Claude run, AskUserQuestion buttons still appear (C4) and ExitPlanMode still renders.
+4. **Tier 3** T1 (voice, in the Antigravity chat), T6, and T9 as `/antigravity list the files here` sent in the Claude chat.
+5. **Tier 4** O1 (`/agent set antigravity` in the Codex chat, a prompt, then `/agent clear`) and O2 (Effort, in the Antigravity chat; see AG-12).
+6. **Tier 6** S2 (Antigravity and Claude at the same time), **S2b** (two Antigravity chats or topics bound to the same project, run in parallel: both finish, neither reads the other's conversation), S6, and S8 (a prompt of about 4,000 characters in the Antigravity chat, which goes to `agy` on stdin; Telegram refuses a single 5,000-character message).
+7. **AG-1 … AG-12 and AG-12a–e** below. AG-12a-long is opt-in.
+8. **Upgrade path:** start the dev bot with a config that has no `[engines.antigravity]` table: no config error and the chat preferences load. A scratch chat whose stored Antigravity mode is hand-edited to `accept-edits` runs as Workspace, with one `antigravity.permission_mode.unknown` WARNING (`accept-edits` is `agy`'s name for the mode Workspace runs under; it is not one of Untether's own mode values, which are `workspace`, `ask`, `plan` and `full`).
+9. **Log sweep:** `journalctl --user -u untether-dev --since "<start>" -o cat | grep -E "WARNING|ERROR"` shows only the lines the rows provoke on purpose: `antigravity.permission_mode.gate_missing` (AG-5), `antigravity.no_project_dir` (AG-6), `antigravity.auth.*` (AG-9), `antigravity.conversation.*` (AG-12b), `antigravity.unattended_full_downgraded` (AG-12c, logged once per cron), `antigravity.workspace_config_present` and `antigravity.workspace_config.unattended_refused` (AG-12d), `antigravity.argv.invalid_value` (AG-12e) and the upgrade-path WARNING. No `subprocess.liveness_stall`, no `subprocess.stderr.hook_error`, no zombies, and `pgrep -fa "agy --input-format"` is empty after the run.
+10. `git -C test-projects/test-antigravity status --porcelain` shows only the agent's own edits. Untether writes no `.agents/` folder; AG-12d's hand-written file is deleted after that row.
+
+### AG scenarios
+
+Run in the Antigravity chat unless a row says otherwise, and send exactly the quoted text. `<uuid>` is the conversation ID from the resume line. In `runner.start`'s `args`, a flag that takes a value is always joined to it (`--conversation=<uuid>`, `--effort=high`, `--model=<id>`), so `agy` can never read the value as another flag; the resume line shown in the chat keeps the spaced form `agy --conversation <uuid>`.
+
+| ID | Steps | Expected in Telegram | Expected log signature |
+|---|---|---|---|
+| AG-1 plain run | `/config` → Permission mode → Clear override. `create a file called hello.txt containing hello world` | The final confirms and the file exists; the footer's last item is `workspace`; the resume line is `` `agy --conversation <uuid>` ``. On a host where `agy` signs in with a Google account, the first run in a chat also carries a one-off notice starting `⚠️ This host signs Antigravity in with a Google account.` and ending `(Shown once in this chat.)`. It does not appear on an API-key or ADC host, unless the `agy -p /config` check failed (a failed check is treated as a Google sign-in) | `antigravity.tos_notice.shown` once per chat on a Google sign-in host; `runner.start engine=antigravity` with args starting `--input-format stream-json --output-format stream-json --print-timeout 0 --disable-slash-commands` and ending `--mode=accept-edits --agent=untether-workspace`, **no prompt text and no `--dangerously-skip-permissions`**; `antigravity.version.probe`; `antigravity.session.started … agy_version=<the installed version>`; `antigravity.run.timing resumed=False`; `runner.completed engine=antigravity ok=True`; `session.summary … last_event_type=result` |
+| AG-2 resume | Reply to AG-1's final: `append a second line saying bye to hello.txt` | Same ID in the resume line; the file has 2 lines; the footer tokens are this run's only (no `· thread total`) | Args have `--conversation=<same uuid>` and still end `--mode=accept-edits --agent=untether-workspace`; `antigravity.run.timing resumed=True`; `usage.token_delta engine=antigravity source=ledger runs=2` |
+| AG-3 tool denial | After `/new`: ``Run the shell command `git status` and summarise it.`` Then `/new` and `create a file at /home/<you>/ag3-outside.txt containing x` | Shell: the reply says shell isn't available in Workspace and that it needs Full access, then `/new`; no `git status` output, no ⚠️ row (the Workspace agent has no shell tool). Outside write: a `⚠️ Blocked: file outside the project (…)` row, the final says Antigravity was blocked and ends `Full access, then /new.`; the file does not exist | Shell: no `antigravity.denied_actions`. Outside write: `antigravity.denied_actions actions=['write_file'] … permission_mode=workspace` |
+| AG-4 Full access | In a conversation that began in Workspace: `/config` → Permission mode → **Full access**; ``Run `python3 hello.py` and tell me the output.``; then `/new` and the same prompt; then Clear override, `/new` and `Reply with exactly: OK` | Toast `Permission mode: full access — send /new to start using it`. First reply (same conversation): footer `full access`, but it says shell isn't available and to send `/new`. After `/new`: the real output is shown; after Clear override the footer is `workspace` again | `config.antigravity_permission_mode.set mode=agf`; args end `--dangerously-skip-permissions` (and carry no `--agent`) for the two Full access runs only; no `antigravity.denied_actions` |
+| AG-5 later modes refused | `/config` → Permission mode → tap **Ask me · soon**, then **Plan first · soon**. Then set `permission_mode = "plan"` under `[engines.antigravity]` in the dev config (hot-reload; if it only applies after a restart, record that as a finding), send `Reply with exactly: OK`, and remove the key | Two toasts, each `Needs Untether's Telegram approval gate — coming in a later 0.36.1 release`, and nothing stored. The run is refused before anything spawns: `Plan first needs Untether's approval gate, which arrives in a later 0.36.1 release — switch to Workspace or Full access in /config.` | `config.antigravity_permission_mode.unavailable` for each tap; `antigravity.permission_mode.gate_missing mode=plan` (WARNING); **no** `runner.start` |
+| AG-6 no project | In a chat with no project bound (the DM): `/agent set antigravity`, `Reply with exactly: OK`, then `/agent clear` | `Antigravity needs a project — bind this chat with /ctx set … or a [projects.*] entry. It won't run in the bot's own directory, because it can edit files there.`; no run | `antigravity.no_project_dir` (WARNING, expected); no `runner.start` |
+| AG-7 `/usage` | After AG-1: `/usage`, `/usage` again within 60 s, `/usage` a third time after 60 s, then `/usage debug` | Quota per group (5-hour and Weekly windows with reset times) under `📊 Antigravity quota`, then `From agy /usage (no quota spent).` and the last session's tokens; the debug output is escaped and has a `• agy version: …` line | `antigravity.quota.fetched` on the first and third calls only (60 s cache); never during a run |
+| AG-8 `/config` labels, Effort, About | `/config` home; the Permission mode page; the Effort page; `/config` → About; `/planmode show`. Then `/model set <a Gemini Pro model id>`, open the Effort page again, and `/model clear` | Home: `Agent controls (Antigravity CLI)` and, with no override and no TOML value, `Permission mode: workspace (default)  · edits files, no shell — not a sandbox` (the source suffix is `(from untether.toml)` when the config sets the mode, and absent with a chat override). The Permission mode page says `Not a sandbox` and never "read-only"; its buttons are Workspace, Full access, `Ask me · soon`, `Plan first · soon`. The Effort page shows `Model: agy default · supports low, medium, high` with those three levels for the default model, and only the levels `agy` reports for a Pro model (Low / High when this was written). If the page says `Couldn't ask agy which levels this model supports — showing the usual three.`, the per-model check is NOT EXERCISED, not a fail. About's versions line includes `antigravity <version>`. `/planmode show`: `Plan mode is only available for Claude Code. … Use /config → Permission mode instead.` | `config.*` lines only; no WARNING |
+| AG-9 signed out | Write a wrapper script under `test-projects/.ag-unauth/` that runs the real `agy` with `HOME` pointed at a new empty folder under `/tmp` (nothing under the real `~/.gemini` is touched). Set `cmd = "<that script>"` under `[engines.antigravity]`, send `Reply with exactly: OK`, then `/usage`, then remove `cmd` | An error final within about 10 s: `Antigravity CLI isn't signed in on this host — agy wanted a browser sign-in, which a bot can't complete. …`, ending with Untether's own help link (`https://littlebearapps.com/help/untether/switch-engines/#antigravity-cli`). That help link is expected; what must **not** appear is Google's OAuth sign-in URL or any query-string secret. `/usage` shows the same text within 15 s | `antigravity.auth.required`, then either `antigravity.auth.killed elapsed_ms<5000` or `agy`'s own exit (1.3.2 exits by itself in about 6 s, so the kill is a safety net); `runner.completed ok=False`; no OAuth sign-in URL or query-string secret in any log line |
+| AG-10 cancel mid-run | `Write a detailed 1500-word essay about ocean tides, in plain prose.`, then `/cancel` at the first progress edit | A cancelled card, not an "interrupted" error; the next prompt works | The cancelled `runner.completed`; `subprocess.exit` for the `agy` pid; `pgrep -f "agy --input-format"` empty within 5 s |
+| AG-11 long-chat resume latency | Six replies in one conversation: `Reply with exactly: t1` … `t6` | Six short finals | `antigravity.run.timing` with `total_ms` and `cumulative_input_tokens` on each turn. Bar: turn 6's `total_ms` is at most twice turn 2's (or at most 15 s) and the tokens only grow. Put the numbers in the attestation notes |
+| AG-12 `/continue` + effort | `/config` → Effort → High; then `/continue reply with the word continued`; then clear the Effort override | Runs on this project's latest conversation; the footer ends `high · workspace`; the resume line carries a real conversation ID | Args contain `--effort=high` and a bare `--continue` (and no `--conversation=`); `antigravity.session.started` with a real conversation ID. (`session_lock.acquired` is logged at DEBUG, so it isn't in the journal at the default level) |
+| AG-12a background hold, short ([#975](https://github.com/littlebearapps/untether/issues/975)) | `/config` → Permission mode → Full access. ``Start `sleep 90; echo done > bg.txt` in the background, reply STARTED straight away, then tell me when bg.txt exists.`` Wait about 2 minutes, then Clear override | **One** final after about 90 s, carrying both replies; `bg.txt` exists; no stall warning and no cancel in the chat while it waits. If `agy` prints anything during the wait, the row is retitled `⏳ background: …` | **No** `subprocess.liveness_stall`, no `progress_edits.stall_detected`, no `progress_edits.stall_auto_cancel`; one `runner.completed ok=True`. `subprocess.background_wait` is **not** expected here (see the note below) |
+| AG-12a-long background hold, 10 minutes (opt-in) | As AG-12a with `sleep 700` in place of `sleep 90`. Wait about 12 minutes | One final after about 700 s; **no** stall warning at the 10-minute mark, where a plain running tool would get one | One `subprocess.background_wait … idle_seconds≥600 background=1`; no `subprocess.liveness_stall`; no `progress_edits.stall_detected`; one `runner.completed ok=True`. If `agy` printed during the wait, idle never reached 600 s: record the row as NOT EXERCISED |
+| AG-12b stale resume | Send a two-line message: `` `agy --conversation 00000000-1111-2222-3333-444444444444` `` on the first line and `Reply OK` on the second | `That Antigravity conversation no longer exists (antigravity conversation not found), so it wasn't resumed — send your message again to start a new one.` (with the `ℹ️ The saved session couldn't be resumed, so it was cleared…` notice when it was the chat's saved session); the next message starts a new conversation | Args have `--conversation=00000000-1111-2222-3333-444444444444`; `antigravity.conversation.missing detected_by=stderr` (WARNING); no `runner.started.error`. `detected_by=init` (the error arrives after `agy`'s turn ends) is still a pass: note it |
+| AG-12c unattended Full access | With the chat on Full access, add a dev cron for the Antigravity project **without** `permission_mode`, prompt ``Run `ls` and list the files``, due in the next minute. Then add `permission_mode = "full"` to the cron and let it fire again. Remove the cron and Clear override | First run: a `⚠️ Blocked` row and advice that names the cron (``set `permission_mode = "full"` on this cron``). Second run: the listing | First: `antigravity.unattended_full_downgraded trigger=cron:<cron id> origin=…` (WARNING, once per cron per process) and args without `--dangerously-skip-permissions`. Second: args with it |
+| AG-12d planted config | By hand, add `test-projects/test-antigravity/.agents/hooks.json` with one named group holding a `Stop` hook that runs `true`. Send `Reply with exactly: OK` twice. Edit the hook command to `true # v2` and fire a 1-minute test cron for the project. Send `Reply with exactly: OK` in the chat, fire the cron again, then delete the file | First message: `⚠️ This project has agy hooks, plugins or MCP servers that Untether doesn't manage (.agents/hooks.json)…`. Second: no such row. First cron: refused with `agy's workspace config changed since someone last ran Antigravity in this chat's project…`. The chat message shows the ⚠️ row again, and the second cron then runs | `antigravity.workspace_config_present digest=…` twice, with two different digests; `antigravity.workspace_config.unattended_refused` for the first cron, with no `runner.start` for it |
+| AG-12e invalid model id | `/model set --dangerously-skip-permissions`, then `Reply with exactly: OK`. Then `/model set gemini$flash` (a character outside the allowed set) and the same prompt. Then `/model clear` and the prompt once more | Both runs are refused before anything spawns: `🛑 That model id isn't valid for Antigravity, so nothing was started. A model id uses letters, digits and . _ - : / only, with no spaces and no leading dash (for example gemini-3.8-flash). Set one with /model set, or go back to the default with /model clear.` After `/model clear` the run works and its footer's last item is `workspace`, never `full access` | `antigravity.argv.invalid_value field=model reason=… preview=…` (WARNING; the preview never shows the raw value) for each refusal; **no** `runner.start` and no `--dangerously-skip-permissions` in any args. The refusal is recorded as `prespawn_blocked=invalid_argument`, so the chat's saved session is kept |
+
+**AG-12a and the real thresholds.** The plan's AG-12a waited 90 s and expected both `subprocess.background_wait` in the log and a `⏳ Antigravity is waiting for 1 background task…` line in the chat. Neither can appear that early:
+
+- The liveness watchdog logs `subprocess.background_wait` only after 600 s with no output from `agy` (`_LIVENESS_TIMEOUT_SECONDS`), and at most once every 1800 s after that.
+- The stall monitor's chat line uses the 1800 s expected-wait threshold, checked once a minute, while Untether treats the hold as expected only for 1860 s (`agy`'s own 30-minute cap plus 60 s). That leaves a window of at most 60 s, so the chat line can't be relied on in a live run. It is covered by unit tests only (`test_stall_monitor_background_waiting_is_expected_wait`, `test_background_held_result_is_expected_wait`, `test_background_wait_expires_after_cap`).
+
+So the row is split. AG-12a (required) proves the user-visible half in 2 minutes: one final with both replies and nothing stall-like. AG-12a-long (opt-in, about 12 minutes of mostly idle time) is the only live check of the `subprocess.background_wait` path.
+
+**Unit-test only (can't be triggered on demand):** the chat line above; an unattended run held because the project's `agy` config could not be checked (a scan timeout or failure: `antigravity.workspace_config.unattended_refused reason=…`); the version guard's refusal of an `agy` older than 1.3.1; and the quota, credits and account-block error cards.
+
+### Results
+
+| ID | Engine / chat | Result | Note |
+|---|---|---|---|
+| Q1–Q16 | Antigravity + Claude | PASS | Antigravity: Q8 gave the `Use /config → Permission mode instead.` hint; Q14 was the first real `agy` turn and carried the one-off Google sign-in notice; Q16 `⏰ triggers: 2 crons` seen while two test crons were configured. Q6's second reply and Q15's cancel reply were not read in the chat (Q15 confirmed by `at.cancelled`). Claude: all 15, Q8 real |
+| U1–U10 | Antigravity | **FAIL** | **Run 1, U1 and U4 blocked:** `antigravity.denied_actions actions=['write_file'] display_names=['WriteToFile'] permission_mode=workspace`, no file written (the Workspace write block, since fixed; see the notes above). U2 PARTIAL: `agy` used a shell command to list the files and was blocked, so the final was only the blocked notice. U3 PASS (14 messages, `answer_len=41993`). U5 PASS on retry: a model override with no effort level was refused by `agy` (`--model … requires --effort`), then `gemini-3.1-pro` + High ran with footer `gemini-3.1-pro · high · workspace`. U6, U7, U8, U9, U10 PASS. **Re-run 2026-10-11 on the fix:** U1 still fails on a fresh conversation (`[#1037](https://github.com/littlebearapps/untether/issues/1037)`, see AG-1); U4 PARTIAL: `agy` copied the file to the new name and could not delete the original without a shell command. **Run 4 (2026-10-11, [#1037](https://github.com/littlebearapps/untether/issues/1037) fix):** U1 PASS 5 of 5 on fresh conversations (see AG-1) |
+| U1–U10 | Claude | PASS | `preamble.applied preamble_len=3338 source=default` on every fresh spawn. Caveats: the chat is bound to the `weather` context, so runs happened there and not in `test-claude` ([#997](https://github.com/littlebearapps/untether/issues/997) shows in U10); after U5's `/model clear` the resumed session stayed on sonnet ([#998](https://github.com/littlebearapps/untether/issues/998)); U3 took 293 s of the 300 s limit |
+| U1, U2, U6 | Codex | PASS | `preamble_len=2574`; U6 `cancelled · codex · 18s`, no orphan. U8 `📊 codex · last session in this chat` also PASS |
+| U1, U2, U6 | OpenCode | PASS | `preamble_len=2574`. U6: the cancel landed before the loop tool started, so it does not prove a tool child is killed. U8 PASS |
+| U1, U2, U6 | Pi | U1b, U2 PASS (run 5, temporary allow config); U6 PASS | First run (2026-10-10): U1 hit an OpenAI 401 from the dev host's stale Pi key; the credential was fixed on 2026-10-11. Re-run `qa-20261011T0215Z`: every Pi turn answered on `gpt-5.5` with `error=None`, `preamble_len=2574`, `runner.completed ok=True`, `subprocess.exit rc=0`, but the host's `pi-permission-system` extension blocked every tool call in U1 and U2, so no file was written or listed (U1b not run: it needs a temporary allow config in the project). U6 `cancelled · pi · 6s`, `session.summary cancelled=True`, no Pi process left. U8 answered with "No token counts were reported" (#899) **Run 5 (2026-10-11):** with a temporary `pi-permission-system` allow config in the Pi test project, U1b wrote the file (`runner.completed ok=True action_count=1`) and a reply resumed the same session (`--session`, same id) and listed the files; the config and the file were removed afterwards |
+| C1, C2, C4 (+ `preamble_len=3338`) | Claude | PASS | C1 `control_request.received tool_name=Write`, toast `Approved`; C2 one WebFetch request, `Denied`, no retry loop; C4 two questions answered through buttons. The approval keyboard was Approve / Deny / cancel (no Discuss). T8 after C1: no keyboard left, so the stale-button toast was not exercised |
+| T1, T6, T9 (`/antigravity`) | Antigravity / Claude | PASS | T1: `🎙` transcript echoed, `handle.incoming … (voice transcribed)`, run completed. T6: five flags and names delivered, no entity error logged; bold rendering not checked. T9 (2026-10-11): `handle.incoming engine=antigravity` from the Claude chat, footer `workspace`, `runner.completed ok=True`; `agy` reached for a shell command, so the final was the blocked-shell notice. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix):** T9 PASS after `/new` (listing returned, no denial); the first attempt resumed a conversation saved before the fix, which keeps `agy`'s default agent |
+| O1, O2 | Codex / Antigravity | PASS | O1 (2026-10-11): `prefs.engine.set engine=antigravity`, the run used `agy` in the Codex chat's project, `prefs.engine.cleared`, `/agent` back to `codex (project default)`; the reply was the blocked-shell notice, not `OK`. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix):** the reply is `OK`, footer `codex-test | workspace`. O2: toast `Reasoning: high`, footer `high · workspace` (inside AG-12). Codex Reasoning page (R15-14a–c): four levels, no Minimal, `minimal` refused |
+| S2, S2b, S6, S8 | Antigravity (+ Claude) | S2 PASS, S6 PASS, S8 PASS (run 4), S2b PASS (run 5) | All 2026-10-11. S2: both runs overlapped and finished with the right topic in each chat (the Claude half needed one plan approval). S6: the empty forward produced no `handle.incoming` and no run. S8: the log half passed (`runner.start` args carry no prompt text, `subprocess.stdin.send bytes=6756`), but in two attempts `agy` reached for a file read outside the project, then a shell command, so the chat showed a blocked notice and never `DONE`; the prompt was 4,069 characters because Telegram refuses a 5,000-character message. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix):** S8 PASS, a 3,958-character prompt answered `DONE` (`subprocess.stdin.send bytes=6648`, no denial). S2b needs a second chat bound to the test project. S7 (Codex, five rapid messages) PASS: 4× `forward.prompt.merged`, one run, one reply **Run 5:** S2b PASS with the Codex chat bound to the Antigravity test project for the row (`/ctx set`, `/antigravity …`, then `/ctx clear`): two `antigravity.session.started` 3 s apart with different ids, both `runner.completed ok=True` in the same folder, each chat got its own topic |
+| AG-1 | Antigravity | PASS (run 4) | Run 1: the file was not created (the Workspace write block, since fixed). Everything else matched: args with no bypass flag (and, in that run, no `--mode` flag), `antigravity.version.probe`, `antigravity.session.started … agy_version=1.3.3`, `antigravity.run.timing resumed=False`, `runner.completed ok=True`, `session.summary … last_event_type=result`, footer `workspace`, resume line, `antigravity.tos_notice.shown` once **Re-run 2026-10-11 on the fix (args end `--mode=accept-edits`): still FAIL, new cause (`[#1037](https://github.com/littlebearapps/untether/issues/1037)`).** Twice on a fresh conversation `agy` opened with a shell `ls -la`, which Workspace blocks, and the final was only the blocked-shell notice; no write was attempted and no `write_file` denial was logged. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix): PASS 5 of 5** on fresh conversations: args end `--mode=accept-edits --agent=untether-workspace`, `antigravity.workspace_agent.installed` once, five files written, no `denied_actions`; `Reply with exactly: OK` also 5 of 5 |
+| AG-2 | Antigravity | PASS (re-run) | Run 1 FAIL: the append was blocked (the Workspace write block). Resume itself worked: `--conversation=<same id>`, `antigravity.run.timing resumed=True`, `token_delta_source=ledger`. **Re-run 2026-10-11 on the fix: PASS.** `hello2.txt` written inside the project with both lines, args `--conversation=<id> --mode=accept-edits`, no `denied_actions`. Negative checks in the same conversation: `git status` still blocked (`actions=['command']`), a write to an absolute path outside the project still blocked (`actions=['write_file']`, file not created) |
+| AG-3 | Antigravity | PASS | `antigravity.denied_actions actions=['command'] … permission_mode=workspace`; non-empty final with the Full access advice. The progress row's wording was not captured. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix), row as rewritten:** an explicit `git status` request got a plain reply that shell needs Full access, then `/new` (no `denied_actions`, nothing ran); a write to an absolute path outside the project was blocked (`actions=['write_file']`, file absent) |
+| AG-4 | Antigravity | PASS | Toast `Permission mode: full access`; `config.antigravity_permission_mode.set mode=agf`; args end `--dangerously-skip-permissions`; footer `full access`, then `workspace` after Clear override. **Run 4 ([#1037](https://github.com/littlebearapps/untether/issues/1037) fix), row as rewritten:** toast `Permission mode: full access — send /new to start using it`; same conversation: args `--conversation=<id> --dangerously-skip-permissions`, reply says to send `/new`; after `/new`: `python3 hello.py` ran and its output was shown; `Permission mode: cleared` |
+| AG-5 | Antigravity | PASS | Both toasts; `config.antigravity_permission_mode.unavailable` ×2; `antigravity.permission_mode.gate_missing mode=plan`, no `runner.start`. The TOML key hot-reloaded, no restart |
+| AG-6 | DM | PASS (run 4) | Run 1: not run (the test session was stopped by its own permission check). 2026-10-11: `antigravity.no_project_dir reason=no_project`, the refusal text as the reply, no `runner.start`; `/agent clear` afterwards |
+| AG-7 | Antigravity | PASS | `antigravity.quota.fetched` on calls 1 and 3 only; `/usage debug` shows `• agy version: 1.3.3` |
+| AG-8 | Antigravity | PASS (run 5) | Home, Permission mode page, Effort page for the default model, About (`antigravity 1.3.3`) and `/planmode show` as written. For `gemini-3.7-flash` and `gemini-3.1-pro` the Effort page showed "Couldn't ask agy which levels this model supports" and logged `antigravity.effort.probe_failed kind=unparseable` (WARNING) twice. `agy models` lists ids with the level as a suffix (`gemini-3.1-pro-high`) **Run 5 (fix):** agy 1.3.3 refuses `/effort --model=<id>` for a model with no default level before running it, and names the levels in the refusal (`requires --effort (available: low, high)`); Untether now reads them from there. `/model set gemini-3.1-pro`, Effort page: `Model: gemini-3.1-pro · supports low, high`, buttons Low / High only, `antigravity.effort.probe available=['low', 'high']`, no WARNING |
+| AG-9 | Antigravity | PASS | Error final in 1 s with Untether's help link; `antigravity.auth.required`, `antigravity.auth.killed elapsed_ms=625`; `/usage` shows the same text; no Google sign-in URL in the journal. Send `/new` first: with a saved session the wrapper's empty home gives the "conversation no longer exists" card instead. Also logged: `antigravity.config_check.failed kind=not_signed_in`, `antigravity.quota.failed` |
+| AG-10 | Antigravity | PASS | `cancelled · antigravity · 14s`; `cancel.requested`, `session.summary cancelled=True`, `handle.cancelled`; no `agy` process left; the next prompt worked |
+| AG-11 | Antigravity | PASS | `total_ms` 14483 / 10237 / 5751 / 7996 / 7114 / 5595; `cumulative_input_tokens` 13920 / 29497 / 46869 / 50015 / 53116 / 56216. Turn 6 is 0.55× turn 2. Turn 1's final was a blocked-shell notice rather than `t1` |
+| AG-12 | Antigravity | PASS | Args `… --continue --effort=high`, no `--conversation=`; footer `high · workspace`; resume line carries a real ID |
+| AG-12a | Antigravity | PASS | One final after 1 m 55 s with both replies; `bg.txt` written; `liveness_stalls=0`, no stall or cancel lines |
+| AG-12a-long (opt-in) | Antigravity | NOT RUN | |
+| AG-12b | Antigravity | PASS | `antigravity.conversation.missing detected_by=stderr`; refusal text in `runner.completed error=`; the next message started a new conversation. Followed by an ERROR-level `antigravity.conversation.killed` |
+| AG-12c | Antigravity (cron) | PASS (run 5) | First run PASS: `antigravity.unattended_full_downgraded trigger=cron:<id> origin=chat`, card names the cron, footer `workspace · ⏰ cron:<id>`. Second run (cron with `permission_mode = "full"`) NOT RUN **Run 5:** second run PASS: a one-shot cron with `permission_mode = "full"` ran with args ending `--dangerously-skip-permissions` and returned the listing; the cron was removed and the dev config restored from its backup |
+| AG-12d | Antigravity (chat + cron) | PASS (run 5) | Chat half PASS: `antigravity.workspace_config_present` twice with two digests, none on the second message, ⚠️ row read after the edit. Cron half NOT RUN **Run 5:** whole row PASS: first message `antigravity.workspace_config_present` (digest A) with the run still on the no-shell agent; after the edit a one-shot cron was refused (`antigravity.workspace_config.unattended_refused`, the "workspace config changed" text, no `runner.start`); a chat message logged `workspace_config_present` with digest B; a second one-shot cron then ran. Planted folder deleted |
+| AG-12e | Antigravity | PASS | `antigravity.argv.invalid_value field=model reason=leading_dash` and `reason=unsupported_character`, masked previews, no `runner.start`; after `/model clear` the run worked with footer `workspace` |
+| Upgrade path | dev | PASS (run 5) | The dev bot ran the whole evening with no `[engines.antigravity]` table and no config error. The stored `accept-edits` half was not run **Run 5:** with `accept-edits` stored as the test chat's Antigravity mode in the chat-prefs state file, the next message logged `antigravity.permission_mode.unknown value=accept-edits` once and ran as Workspace (`--mode=accept-edits --agent=untether-workspace`); state file restored from its backup, `/config` shows `workspace (default)` again |
+| Logs | dev | NOT RUN | Partial check only: no `subprocess.liveness_stall`, no `subprocess.stderr.hook_error`, no Traceback, no `agy --input-format` process after the run. The full sweep is owed |

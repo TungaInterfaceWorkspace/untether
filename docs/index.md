@@ -6,7 +6,7 @@ title: untether
 
 Untether runs coding agents on your computer and bridges them to Telegram. Send a task from your phone while walking the dog, dictate the next one by voice at the gym, and review results on your tablet later — your agents keep working even if you close Telegram or lose signal. Scale from quick one-offs to multi-project workflows with topics and parallel worktrees.
 
-It works with Claude Code, Codex, OpenCode (1.x) and Pi; approval buttons, plan mode, questions and steering are Claude Code features. Gemini CLI and Amp still load but are deprecated and no longer supported. Website: [untether.cc](https://untether.cc).
+It works with Claude Code, Codex, OpenCode (1.x), Pi and Antigravity CLI; approval buttons, plan mode, questions and steering are Claude Code features. Gemini CLI and Amp still load but are deprecated and no longer supported. Website: [untether.cc](https://untether.cc).
 
 <div class="hero-demo">
 <div class="hero-chat">
@@ -77,6 +77,7 @@ Step-by-step guides for new users:
 
 ## How-to guides
 
+- [Switch engines](how-to/switch-engines.md), [Use Antigravity CLI](how-to/antigravity.md)
 - [Chat sessions](how-to/chat-sessions.md), [Topics](how-to/topics.md), [Projects](how-to/projects.md), [Worktrees](how-to/worktrees.md)
 - [Plan mode](how-to/plan-mode.md), [Interactive approval](how-to/interactive-approval.md), [Steer follow-ups](how-to/steer-follow-ups.md), [Cost budgets](how-to/cost-budgets.md)
 - [Voice notes](how-to/voice-notes.md), [File transfer](how-to/file-transfer.md), [Export sessions](how-to/export-sessions.md)

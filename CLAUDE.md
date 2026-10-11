@@ -27,7 +27,7 @@ Area rules in `.claude/rules/` load automatically when you read matching files; 
 ## Architecture
 
 ```
-Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/gemini/amp)
+Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/antigravity/gemini/amp)
                                        |
                                   ProgressTracker
 ```
@@ -39,13 +39,25 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 - **Schemas** (`src/untether/schemas/`) — msgspec structs for JSONL; **Triggers** (`src/untether/triggers/`) — cron/webhooks
 - Config: `untether.toml` (with `watch_config = true` most sections hot-reload — off by default; `bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow` need a restart, as does turning `[triggers] enabled` on)
 
+## Engine work is native-first (CRITICAL)
+
+Every fix, update, enhancement or new feature for a supported engine (Claude Code, Codex, OpenCode, Pi, Antigravity)
+and for any engine added later **must use what the engine ships natively** — CLI flags, config, hooks, and its
+protocol's events and mid-session requests (the engine's SDK docs describe these). Build custom Untether functionality
+**only** when the engine doesn't provide the feature *on Untether's surface* (headless, no TypeScript-only or
+experimental APIs, the user's own login, durable enough for the job), and record the gap in the engine's register.
+Check the installed version's docs before designing, never memory. Taking an engine's SDK package as a dependency is
+Nathan's call. Full rule: `.claude/rules/runner-development.md` → "Native-first".
+
 ## Deprecated engines (Gemini CLI, AMP)
 
 Both still ship and load but are strictly deprecated and no longer supported — no removal is scheduled, though a future
 release may drop them (Gemini: upstream EOL for individual accounts, hangs under Untether until the watchdog cancels;
 AMP: remote `426` refusal). **When a cross-engine sweep breaks either runner, `xfail`/`skip` the test — do NOT fix the
 runner.** Security and doc-accuracy fixes still apply. Both are excluded from every integration-test tier. Antigravity
-CLI (#558, ships in v0.36.1) is a new engine and must not reuse the `gemini` id.
+CLI (`antigravity`, #558) is its own engine from v0.36.1 and must never reuse the `gemini` id: rc1 runs it with a pre-run
+permission mode (Workspace by default, never bypass unless Full access is chosen); approval buttons and plan approval come
+via hooks in rc3. Every value that reaches `agy`'s argv goes through `utils/antigravity_argv.py` (`--flag=value` only).
 Engine parity roadmap: v0.36.1 Antigravity (#558), v0.36.2 Codex app-server (#960–#968), v0.36.3 OpenCode ACP (#969–#974).
 OpenCode support means the 1.x CLI (npm `opencode-ai`); 2.x (`@opencode/cli`) is refused before spawning (#970).
 

@@ -25,6 +25,7 @@ nav = [
   { "How-to" = [
     { "Overview" = "how-to/index.md" },
     { "Switch engines" = "how-to/switch-engines.md" },
+    { "Antigravity CLI" = "how-to/antigravity.md" },
     { "Projects" = "how-to/projects.md" },
     { "Worktrees" = "how-to/worktrees.md" },
     { "Route by chat" = "how-to/route-by-chat.md" },
@@ -95,6 +96,11 @@ nav = [
         { "Runner" = "reference/runners/pi/runner.md" },
         { "Stream JSON cheatsheet" = "reference/runners/pi/stream-json-cheatsheet.md" },
         { "Untether events" = "reference/runners/pi/untether-events.md" },
+      ] },
+      { "Antigravity" = [
+        { "Runner" = "reference/runners/antigravity/runner.md" },
+        { "Stream JSON cheatsheet" = "reference/runners/antigravity/stream-json-cheatsheet.md" },
+        { "Untether events" = "reference/runners/antigravity/untether-events.md" },
       ] },
       { "Gemini" = [
         { "Runner" = "reference/runners/gemini/runner.md" },

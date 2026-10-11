@@ -32,6 +32,12 @@ class EngineRunOptions:
     # equality on purpose: a human reply into a still-live cron process is not
     # written into it (``options_changed``) but resumes in an attended one.
     unattended_trigger: str | None = None
+    # #558 (08 §10, REVIEW M3): the trigger's *own* ``permission_mode`` (a
+    # cron's), set beside ``permission_mode`` by ``_apply_trigger_overrides``.
+    # By the time options reach a runner, a cron's own ``"full"`` and one
+    # inherited from the chat or TOML look identical; only the agy runner
+    # reads this, so unattended runs never inherit Full access.
+    trigger_permission_mode: str | None = None
 
 
 # Permission modes the Claude Code CLI accepts for ``--permission-mode``.
@@ -94,9 +100,25 @@ LEGACY_CLAUDE_PLAN_AUTO_MODE = "auto"
 # validator accepts any non-empty string for those).
 # Extending this dict requires auditing the runner to ensure each value maps to
 # a defined CLI / protocol outcome — see issues #331 (Codex + Gemini completion)
-# and #332 (full cross-engine extension).
+# and #332 (full cross-engine extension). Last audited 2026-10-11 for
+# ``antigravity`` (#558, agy 1.3.3): every value below maps to a defined
+# outcome in ``runners/antigravity.py`` (``_effective_mode``).
+#
+# Antigravity (D21, D37): ``workspace`` = agy's ``--mode=accept-edits``
+# (without it headless agy refuses file writes inside the project),
+# ``full`` = ``--dangerously-skip-permissions``; ``ask`` / ``plan`` need
+# Untether's approval gate and are refused before spawn until it ships, but
+# stay valid so configs written now keep working. ``accept-edits`` is not an
+# Untether value: it is what Workspace already passes to agy. Unknown
+# stored values fail **closed** to Workspace — unlike Codex, whose unknown
+# mode fails open (``codex.py``).
+ANTIGRAVITY_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"workspace", "ask", "plan", "full"}
+)
+
 VALID_PERMISSION_MODES_BY_ENGINE: dict[str, frozenset[str]] = {
     "claude": CLAUDE_CLI_PERMISSION_MODES | {CLAUDE_PLAN_AUTO_MODE},
+    "antigravity": ANTIGRAVITY_PERMISSION_MODES,
 }
 
 

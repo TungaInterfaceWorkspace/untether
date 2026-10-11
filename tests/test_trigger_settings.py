@@ -221,6 +221,28 @@ class TestCronConfig:
                 permission_mode="yoloMode",
             )
 
+    @pytest.mark.parametrize("mode", ["workspace", "ask", "plan", "full"])
+    def test_cron_antigravity_permission_mode_validated(self, mode):
+        c = CronConfig(
+            id="cr",
+            schedule="* * * * *",
+            engine="antigravity",
+            prompt="Hi",
+            permission_mode=mode,
+        )
+        assert c.permission_mode == mode
+
+    @pytest.mark.parametrize("mode", ["yolo", "accept-edits", "bypassPermissions"])
+    def test_cron_antigravity_permission_mode_rejects_unknown(self, mode):
+        with pytest.raises(ValidationError, match="unknown permission_mode"):
+            CronConfig(
+                id="cr",
+                schedule="* * * * *",
+                engine="antigravity",
+                prompt="Hi",
+                permission_mode=mode,
+            )
+
     def test_permission_mode_accepts_anything_for_unknown_engine(self):
         # Forward-compatible behaviour: engines not in
         # VALID_PERMISSION_MODES_BY_ENGINE accept any non-empty string; the
@@ -286,6 +308,25 @@ class TestCronModelReasoning:
             id="x", schedule="* * * * *", prompt="Hi", engine=engine, reasoning=level
         )
         assert c.reasoning == level
+
+    def test_cron_antigravity_reasoning_high_accepted(self):
+        """#558 phase 05: agy joins the reasoning engines (low/medium/high)."""
+        c = CronConfig(
+            id="x",
+            schedule="* * * * *",
+            prompt="Hi",
+            engine="antigravity",
+            reasoning="high",
+        )
+        assert c.reasoning == "high"
+        with pytest.raises(ValidationError, match="allowed values"):
+            CronConfig(
+                id="x",
+                schedule="* * * * *",
+                prompt="Hi",
+                engine="antigravity",
+                reasoning="max",
+            )
 
     def test_743_reasoning_normalised_to_lower_case(self):
         c = CronConfig(
