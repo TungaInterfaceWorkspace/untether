@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 import structlog.testing
 
@@ -37,8 +38,10 @@ from untether.utils import antigravity_scan as scan
 from untether.utils.paths import (
     reset_run_base_dir,
     reset_run_channel_id,
+    reset_run_trigger_source,
     set_run_base_dir,
     set_run_channel_id,
+    set_run_trigger_source,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "antigravity"
@@ -731,7 +734,12 @@ async def test_unattended_run_refused_on_digest_change(
     assert isinstance(done, CompletedEvent) and done.ok is False
     assert done.usage == {PRESPAWN_BLOCKED_KEY: "config_changed"}
     assert ".agents/hooks.json" in (done.error or "")
-    assert "Send any message in the chat" in (done.error or "")
+    # #1044: the wording says what the next message does — it runs with the
+    # changed config — and never promises a review before anything runs.
+    error = done.error or ""
+    assert "Send any message" not in error and "to review it" not in error
+    assert "will run with the changed config" in error
+    assert "⚠️ row" in error
     assert not record.exists()
     assert any(
         e["event"] == "antigravity.workspace_config.unattended_refused" for e in logs
@@ -841,17 +849,29 @@ async def test_config_allow_rules_and_non_workspace_access_warn_once_per_digest(
 
 
 @pytest.mark.anyio
-async def test_config_check_failure_fails_open(
+async def test_config_check_failure_alone_fails_open_with_warning(
     project: Path,
     gemini_home: Path,
     agy_config: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Was ``test_config_check_failure_fails_open``. A failed check before
+    the run still lets an attended run go ahead on its own — agy's ``init``
+    report covers it — but now says so (#1044)."""
     monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
     agy_config["value"] = None
     runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
-    events = await _run(runner)
+    with structlog.testing.capture_logs() as logs:
+        events = await _run(runner)
     assert _completed(events).ok is True
+    (row,) = _warning_rows(events)
+    assert row.action.title.startswith("⚠️ Untether couldn't read agy's")
+    assert "the check failed" in row.action.title
+    assert "request-review" in row.action.title
+    (log,) = [
+        e for e in logs if e["event"] == "antigravity.permission_mode.unconfirmed"
+    ]
+    assert log["source"] == "config" and log["log_level"] == "warning"
 
 
 @pytest.mark.anyio
@@ -1793,3 +1813,652 @@ def test_project_root_search_exhausted_is_unchecked(
     shallow = repo / "d0" / "d1"
     shallow.mkdir(parents=True, exist_ok=True)
     assert scan.scan_workspace_config(shallow).unchecked_reason is None
+
+
+# ── #1044: agy's tool-permission value can't be confirmed ───────────────────
+
+CHECK_FAILED = "the check failed"
+
+
+def _edit_init(line: str, *, drop_mode: bool) -> str | None:
+    """An ``init`` line without its ``permission_mode`` (or dropped: None)."""
+    obj = json.loads(line)
+    if obj.get("event") != "init":
+        return line
+    if not drop_mode:
+        return None
+    obj["init"].pop("permission_mode", None)
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _init_lines(name: str, *, drop_mode: bool) -> list[str]:
+    edited = (_edit_init(ln, drop_mode=drop_mode) for ln in _lines(name))
+    return [ln for ln in edited if ln is not None]
+
+
+def _init_script(tmp_path: Path, *, drop_mode: bool, name: str = "ok") -> Path:
+    """``<name>.script`` whose ``init`` has no ``permission_mode``
+    (``drop_mode``) or is missing altogether."""
+    out: list[str] = []
+    for line in (FIXTURES / f"{name}.script").read_text().splitlines():
+        if line.startswith("out:"):
+            edited = _edit_init(line[4:], drop_mode=drop_mode)
+            if edited is None:
+                continue
+            line = "out:" + edited
+        out.append(line)
+    script = tmp_path / "no_mode.script"
+    script.write_text("\n".join(out) + "\n")
+    return script
+
+
+def _replay_with(
+    precheck: agy._RunPrecheck, lines: list[str]
+) -> tuple[list[Any], AntigravityStreamState]:
+    token = agy._PRECHECK.set(precheck)
+    try:
+        return _replay(lines)
+    finally:
+        agy._PRECHECK.reset(token)
+
+
+def _replay_unknown(lines: list[str]) -> tuple[list[Any], AntigravityStreamState]:
+    """Replay as if the check before the run had failed."""
+    return _replay_with(agy._RunPrecheck(permission_unknown=CHECK_FAILED), lines)
+
+
+def _replay_known(lines: list[str]) -> tuple[list[Any], AntigravityStreamState]:
+    return _replay_with(agy._RunPrecheck(config=_config()), lines)
+
+
+@pytest.mark.parametrize("drop_mode", [True, False], ids=["no_field", "no_init"])
+@pytest.mark.anyio
+async def test_both_checks_unknown_refuses_attended_workspace_run(
+    drop_mode: bool,
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT", str(_init_script(tmp_path, drop_mode=drop_mode))
+    )
+    agy_config["value"] = None
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    with structlog.testing.capture_logs() as logs:
+        events = await _run(runner)
+    done = _completed(events)
+    assert done.ok is False
+    assert "couldn't confirm agy's tool-permission" in (done.error or "")
+    assert not any(isinstance(e, StartedEvent) for e in events)
+    (log,) = [e for e in logs if e["event"] == "antigravity.permission_mode.unverified"]
+    assert log["log_level"] == "error"
+    assert log["source"] == ("init" if drop_mode else "no_init")
+
+
+@pytest.mark.parametrize("value", [None, 7, ""])
+@pytest.mark.anyio
+async def test_unusable_tool_permission_counts_as_unknown(
+    value: Any,
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agy's own config was read but carries no usable ``toolPermission``."""
+    agy_config["value"] = _config(toolPermission=value)
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    events = await _run(runner)
+    assert _completed(events).ok is True
+    (row,) = _warning_rows(events)
+    assert "no toolPermission value" in row.action.title
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT", str(_init_script(tmp_path, drop_mode=True))
+    )
+    assert _completed(await _run(runner)).ok is False
+
+
+@pytest.mark.parametrize("trigger", ["cron:nightly", "webhook:gh"])
+@pytest.mark.anyio
+async def test_unattended_workspace_run_held_when_precheck_unknown(
+    trigger: str,
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nobody is there to read a ⚠️ row: held before agy starts, even though
+    this fake agy would report a safe mode."""
+    record = tmp_path / "record.json"
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_RECORD", str(record))
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    agy_config["value"] = None
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    with structlog.testing.capture_logs() as logs:
+        (done,) = await _run(runner, EngineRunOptions(unattended_trigger=trigger))
+    assert isinstance(done, CompletedEvent) and done.ok is False
+    assert done.usage == {PRESPAWN_BLOCKED_KEY: "tool_permission_unknown"}
+    assert "scheduled run is held" in (done.error or "")
+    assert not record.exists()
+    (log,) = [e for e in logs if e["event"] == "antigravity.permission_mode.unverified"]
+    assert log["trigger"] == trigger and log["source"] == "config"
+    # Held, not broken: a WARNING, so the error-report watcher stays quiet.
+    assert log["log_level"] == "warning"
+    # The check works again → the schedule runs.
+    agy_config["value"] = _config()
+    events = await _run(runner, EngineRunOptions(unattended_trigger=trigger))
+    assert _completed(events).ok is True
+
+
+@pytest.mark.anyio
+async def test_unknown_tool_permission_never_stops_full_access(
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT", str(_init_script(tmp_path, drop_mode=True))
+    )
+    agy_config["value"] = None
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    for options in (
+        EngineRunOptions(permission_mode="full"),
+        EngineRunOptions(
+            permission_mode="full",
+            trigger_permission_mode="full",
+            unattended_trigger="cron:nightly",
+        ),
+    ):
+        events = await _run(runner, options)
+        assert _completed(events).ok is True
+        assert not _warning_rows(events)
+
+
+@pytest.mark.parametrize("drop_mode", [True, False], ids=["no_field", "no_init"])
+@pytest.mark.anyio
+async def test_init_report_missing_alone_proceeds_with_warning(
+    drop_mode: bool,
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT", str(_init_script(tmp_path, drop_mode=drop_mode))
+    )
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    with structlog.testing.capture_logs() as logs:
+        events = await _run(runner)
+    assert _completed(events).ok is True
+    (row,) = _warning_rows(events)
+    assert row.action.title.startswith("⚠️ agy didn't report its permission mode")
+    assert "toolPermission: request-review" in row.action.title
+    (log,) = [
+        e for e in logs if e["event"] == "antigravity.permission_mode.unconfirmed"
+    ]
+    assert log["source"] == ("init" if drop_mode else "no_init")
+    # An unattended run with a good check before it is not held for this.
+    events = await _run(runner, EngineRunOptions(unattended_trigger="cron:x"))
+    assert _completed(events).ok is True
+
+
+@pytest.mark.anyio
+async def test_both_checks_known_show_no_permission_row(
+    project: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    with structlog.testing.capture_logs() as logs:
+        events = await _run(runner)
+    assert _completed(events).ok is True
+    assert not _warning_rows(events)
+    assert not [e for e in logs if "permission_mode.un" in e["event"]]
+
+
+def test_step_before_any_init_refused_when_precheck_unknown() -> None:
+    """No ``init`` at all: the first step is where the run is stopped."""
+    events, state = _replay_unknown(_init_lines("tools_denied", drop_mode=False))
+    (done,) = events
+    assert isinstance(done, CompletedEvent) and done.ok is False
+    assert "couldn't confirm" in (done.error or "")
+    assert state.permission_refused is True
+    assert state.pending_actions == {} and state.session_id is None
+
+
+def test_init_non_safe_value_still_refused_when_precheck_unknown() -> None:
+    lines = _with_init_mode(_lines("tools_denied"), "always-proceed")
+    (done,) = _replay_unknown(lines)[0]
+    assert isinstance(done, CompletedEvent) and done.ok is False
+    assert done.error == agy.ALWAYS_PROCEED_TEXT
+
+
+def test_init_safe_value_with_precheck_unknown_runs_with_one_row() -> None:
+    events, _ = _replay_unknown(_lines("tools_denied"))
+    assert isinstance(events[0], StartedEvent)
+    rows = [r for r in _warning_rows(events) if "couldn't read agy's" in r.action.title]
+    assert len(rows) == 1
+    assert events.index(rows[0]) == 1  # right after Started
+
+
+def test_missing_init_report_with_precheck_known_runs() -> None:
+    events, state = _replay_known(_init_lines("tools_denied", drop_mode=True))
+    assert isinstance(events[0], StartedEvent)
+    assert state.permission_refused is False
+    assert isinstance(events[-1], CompletedEvent)
+
+
+def test_error_result_without_init_keeps_agys_own_error() -> None:
+    """A run that fails before ``init`` (bad model, not signed in) never
+    reached a step: the user needs agy's error, not a permission refusal."""
+    events, state = _replay_unknown(_lines("invalid_model"))
+    assert state.permission_refused is False
+    assert "couldn't confirm" not in (_completed(events).error or "")
+
+
+# ── #1044: /at and /loop re-fires never acknowledge changed agy config ──────
+
+
+async def _run_from(runner: AntigravityRunner, source: str | None) -> list[Any]:
+    token = set_run_trigger_source(source)
+    try:
+        return await _run(runner)
+    finally:
+        reset_run_trigger_source(token)
+
+
+def _present_rows(events: list[Any]) -> list[ActionEvent]:
+    return [r for r in _warning_rows(events) if "doesn't manage" in r.action.title]
+
+
+@pytest.mark.parametrize("source", ["at:1f2e3d", "loop:ut_loop_ab12cd34"])
+@pytest.mark.anyio
+async def test_scheduled_refire_does_not_clear_config_hold(
+    source: str,
+    project: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    cron = EngineRunOptions(unattended_trigger="cron:x")
+    for _ in range(2):  # the re-fire itself still runs, with the row each time
+        with structlog.testing.capture_logs() as logs:
+            events = await _run_from(runner, source)
+        assert _completed(events).ok is True
+        (row,) = _present_rows(events)
+        assert ".agents/hooks.json" in row.action.title
+        (log,) = [
+            e for e in logs if e["event"] == "antigravity.workspace_config_present"
+        ]
+        assert log["recorded"] is False and log["trigger"] == source
+        # Nobody has seen it: the cron stays held.
+        (done,) = await _run(runner, cron)
+        assert done.usage == {PRESPAWN_BLOCKED_KEY: "config_changed"}
+    # A person's message is what acknowledges it.
+    with structlog.testing.capture_logs() as logs:
+        events = await _run_from(runner, None)
+    assert len(_present_rows(events)) == 1
+    (log,) = [e for e in logs if e["event"] == "antigravity.workspace_config_present"]
+    assert log["recorded"] is True
+    assert _completed(await _run(runner, cron)).ok is True
+
+
+def test_hold_messages_say_what_the_next_message_does() -> None:
+    changed = agy.config_changed_message([".agents/hooks.json"])
+    assert changed.startswith(
+        "agy's workspace config changed since someone last ran Antigravity"
+    )
+    assert "this scheduled run is held" in changed
+    assert "will run with the changed config" in changed
+    unchecked = agy.config_unchecked_message("too many files")
+    for text in (changed, unchecked):
+        assert "Send any message" not in text and "review it" not in text
+    assert "still runs" in unchecked and "too many files" in unchecked
+
+
+# ── #1044: the no-project check fails closed on a path it can't resolve ─────
+
+
+# RuntimeError: what Python 3.12's ``Path.resolve()`` raises for a symlink loop.
+@pytest.mark.parametrize("exc_type", [OSError, RuntimeError])
+@pytest.mark.anyio
+async def test_unresolvable_project_dir_refused(
+    exc_type: type[Exception],
+    project: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = tmp_path / "record.json"
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_RECORD", str(record))
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if self == project:
+            raise exc_type("too many levels of symbolic links")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    with structlog.testing.capture_logs() as logs:
+        (done,) = await _run(runner)
+    assert isinstance(done, CompletedEvent) and done.ok is False
+    assert done.usage == {PRESPAWN_BLOCKED_KEY: "no_project"}
+    assert not record.exists()
+    (log,) = [e for e in logs if e["event"] == "antigravity.no_project_dir"]
+    assert log["reason"] == "unresolved_dir"
+
+
+# ── #1045: the ⚠️ rows reach the delivered final ────────────────────────────
+#
+# The rows above live on the progress message, which the final answer
+# replaces. Through ``handle_message`` with the real runner and fake agy, the
+# delivered final carries each distinct row once, after the answer.
+
+PRESENT = "This project has agy hooks, plugins or MCP servers that Untether"
+
+
+def _final_script(
+    tmp_path: Path,
+    *,
+    name: str = "ok",
+    result: dict[str, Any] | None = None,
+    drop_mode: bool | None = None,
+    hold_after_init: float = 0.0,
+) -> Path:
+    """*name*'s capture with no gaps (except an optional hold after
+    ``init``), its ``result`` edited and/or its ``init`` mode dropped."""
+    out: list[str] = []
+    for line in (FIXTURES / f"{name}.script").read_text().splitlines():
+        if line.startswith("sleep:"):
+            continue
+        if line.startswith("out:"):
+            payload: str | None = line[4:]
+            if drop_mode is not None:
+                payload = _edit_init(payload, drop_mode=drop_mode)
+                if payload is None:
+                    continue
+            obj = json.loads(payload)
+            if result and obj.get("event") == "result":
+                obj["result"].update(result)
+                payload = json.dumps(obj, separators=(",", ":"))
+            out.append("out:" + payload)
+            if hold_after_init and obj.get("event") == "init":
+                out.append(f"sleep:{hold_after_init}")
+            continue
+        out.append(line)
+    script = tmp_path / f"final_{name}.script"
+    script.write_text("\n".join(out) + "\n")
+    return script
+
+
+async def _bridge(
+    runner: AntigravityRunner,
+    *,
+    presenter: Any = None,
+    options: EngineRunOptions | None = None,
+) -> Any:
+    from tests.telegram_fakes import FakeTransport
+    from untether.runner_bridge import ExecBridgeConfig, IncomingMessage, handle_message
+    from untether.telegram.bridge import TelegramPresenter
+
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=presenter or TelegramPresenter(),
+        final_notify=True,
+    )
+    with apply_run_options(options), anyio.fail_after(30):
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(
+                channel_id=4242, message_id=10, text="Reply with exactly: OK"
+            ),
+            resume_token=None,
+            running_tasks={},
+        )
+    return transport
+
+
+def _final_texts(transport: Any) -> list[str]:
+    """The delivered final: its text plus any split follow-up chunks."""
+    final = transport.send_calls[-1]["message"]
+    return [final.text, *(f.text for f in final.extra.get("followups", []))]
+
+
+@pytest.mark.anyio
+async def test_config_present_row_reaches_the_final(
+    project: Path, tmp_path: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live finding: a planted agent, a 4 s run, no ⚠️ anywhere."""
+    from untether import runner_bridge
+    from untether.settings import ProgressSettings
+
+    monkeypatch.setattr(
+        runner_bridge,
+        "_load_progress_settings",
+        lambda: ProgressSettings(min_render_interval=0),
+    )
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(_final_script(tmp_path, hold_after_init=0.6)),
+    )
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_TIME_SCALE", "1")
+    _write(project / ".agents" / "agents" / "x" / "agent.md", "# x\n")
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    # Still a row on the progress message while the run streams.
+    progress = [c["message"].text for c in transport.edit_calls]
+    assert any(PRESENT in t for t in progress), progress
+    (final,) = _final_texts(transport)
+    assert final.count(PRESENT) == 1, final
+    assert ".agents/agents/x/agent.md" in final
+    # After the answer, before the footer.
+    assert final.index("OK") < final.index(PRESENT)
+    assert "Review them if you didn't add them." in final
+
+
+@pytest.mark.parametrize("drop_mode", [True, False], ids=["no_field", "no_init"])
+@pytest.mark.anyio
+async def test_permission_unreported_row_reaches_the_final(
+    drop_mode: bool,
+    project: Path,
+    tmp_path: Path,
+    gemini_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(_final_script(tmp_path, drop_mode=drop_mode)),
+    )
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    assert final.count("⚠️ agy didn't report its permission mode") == 1, final
+    assert "toolPermission: request-review" in final
+
+
+@pytest.mark.anyio
+async def test_permission_precheck_unknown_row_reaches_the_final(
+    project: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    agy_config["value"] = None
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    assert final.count("⚠️ Untether couldn't read agy's tool-permission") == 1
+    assert "the check failed" in final and "so the run continues" in final
+
+
+@pytest.mark.anyio
+async def test_several_rows_each_on_their_own_line_in_the_final(
+    project: Path,
+    gemini_home: Path,
+    agy_config: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    agy_config["value"] = _config(
+        allowNonWorkspaceAccess=True, permissions={"allow": ["command(ls)"]}
+    )
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    rows = [ln for ln in final.splitlines() if ln.startswith("⚠️")]
+    assert len(rows) == 3, final
+    assert PRESENT in rows[0]
+    assert "files outside the project" in rows[1]
+    assert "1 command pattern(s)" in rows[2]
+
+
+@pytest.mark.anyio
+async def test_config_changed_during_run_reaches_the_final(
+    project: Path, tmp_path: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-check after the result: its row comes before the final event."""
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(_hold_script(tmp_path, write=".agents/hooks.json")),
+    )
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    assert final.count("⚠️ Antigravity changed .agents/hooks.json") == 1, final
+    assert "Review it before sending another message." in final
+
+
+@pytest.mark.anyio
+async def test_final_without_warning_rows_is_unchanged(
+    project: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "ok")
+    runner = AntigravityRunner(antigravity_cmd=str(FAKE_AGY))
+    assert _completed(await _run(runner)).answer == "OK\n"
+    (final,) = _final_texts(await _bridge(runner))
+    assert "⚠️" not in final
+
+
+@pytest.mark.anyio
+async def test_blocked_rows_keep_their_own_paragraph_only(
+    project: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1037's ``⚠️ Blocked`` row already reaches the reply as the denial
+    paragraph (appended to the answer); it isn't repeated in the block."""
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", "tools_denied")
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    assert "⚠️ Blocked" not in final
+    assert final.count("⚠️ Antigravity was blocked from using a shell command") == 1
+    assert final.count(PRESENT) == 1
+    # The denial paragraph (the answer's) comes first, then the block.
+    assert final.index("was blocked") < final.index(PRESENT)
+
+
+@pytest.mark.anyio
+async def test_warning_block_once_in_a_split_final(
+    project: Path, tmp_path: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from untether.telegram.bridge import TelegramPresenter
+
+    long_answer = "\n\n".join(f"Paragraph {i}: " + "word " * 120 for i in range(20))
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(_final_script(tmp_path, result={"response": long_answer})),
+    )
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    transport = await _bridge(
+        AntigravityRunner(antigravity_cmd=str(FAKE_AGY)),
+        presenter=TelegramPresenter(message_overflow="split"),
+    )
+    texts = _final_texts(transport)
+    assert len(texts) > 1
+    assert sum(t.count(PRESENT) for t in texts) == 1, texts
+    # In the last chunk, after the answer's last paragraph.
+    assert PRESENT in texts[-1]
+    assert texts[-1].index("Paragraph 19") < texts[-1].index(PRESENT)
+
+
+@pytest.mark.anyio
+async def test_warning_block_in_an_error_final(
+    project: Path, tmp_path: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(
+            _final_script(
+                tmp_path,
+                result={"status": "ERROR", "error": "model overloaded"},
+            )
+        ),
+    )
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    transport = await _bridge(AntigravityRunner(antigravity_cmd=str(FAKE_AGY)))
+    (final,) = _final_texts(transport)
+    assert final.count(PRESENT) == 1, final
+    assert "model overloaded" in final
+
+
+@pytest.mark.anyio
+async def test_cancelled_run_keeps_the_row_once(
+    project: Path, tmp_path: Path, gemini_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled run has no final answer: the cancelled render is the
+    progress message, rows included (unchanged), and nothing is added."""
+    from tests.telegram_fakes import FakeTransport
+    from untether.runner_bridge import ExecBridgeConfig, IncomingMessage, handle_message
+    from untether.telegram.bridge import TelegramPresenter
+
+    monkeypatch.setenv(
+        "UNTETHER_FAKE_AGY_SCRIPT",
+        str(_final_script(tmp_path, hold_after_init=30)),
+    )
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_TIME_SCALE", "1")
+    _write(project / ".agents" / "hooks.json", '{"x": 1}')
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=TelegramPresenter(), final_notify=True
+    )
+    running_tasks: dict[Any, Any] = {}
+
+    async def run() -> None:
+        await handle_message(
+            cfg,
+            runner=AntigravityRunner(antigravity_cmd=str(FAKE_AGY)),
+            incoming=IncomingMessage(channel_id=4242, message_id=10, text="go"),
+            resume_token=None,
+            running_tasks=running_tasks,
+        )
+
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run)
+            while not running_tasks:
+                await anyio.sleep(0.01)
+            task = running_tasks[next(iter(running_tasks))]
+            await task.resume_ready.wait()
+            await anyio.sleep(0.3)
+            task.cancel_requested.set()
+    last = transport.edit_calls[-1]["message"].text
+    assert "cancelled" in last.lower()
+    assert last.count(PRESENT) == 1, last
+
+
+def test_final_warning_block_dedupes_and_escapes() -> None:
+    block = agy.final_warning_block(
+        ["⚠️ one *two* [x](y)", "⚠️ second row", "⚠️ one *two* [x](y)"]
+    )
+    assert block == "⚠️ one \\*two\\* \\[x\\]\\(y\\)  \n⚠️ second row"
+    assert agy.final_warning_block([]) is None

@@ -32,6 +32,7 @@ from .context import RunContext
 from .error_hints import SESSION_NOT_LOADED_HINT as _SESSION_NOT_LOADED_HINT
 from .error_hints import get_error_hint as _get_error_hint
 from .events import EventFactory
+from .live_sessions import live_backend
 from .logging import bind_run_context, get_logger
 from .markdown import _short_model_name, format_meta_line, render_event_cli
 from .model import (
@@ -1137,6 +1138,78 @@ async def _maybe_append_usage_footer(
     except Exception:  # noqa: BLE001 — cosmetic footer must never block final message
         logger.debug("usage_footer.failed", exc_info=True)
         return msg
+
+
+async def _maybe_append_antigravity_quota_footer(
+    msg: RenderedMessage,
+    *,
+    always_show: bool = False,
+    runner: Any = None,
+) -> RenderedMessage:
+    """Antigravity's quota footer (#979): built from what ``/usage`` last
+    cached for this agy, if that is under 15 min old. It never starts agy —
+    a final must not wait on a quota probe (REVIEW M8) — so with nothing
+    cached the message is returned unchanged.
+
+    Same rule as Claude's: *always_show* adds a compact line per quota
+    group, otherwise only groups at 70 % or more of a limit are shown."""
+    try:
+        from .utils import antigravity_quota
+
+        command = getattr(runner, "command", None)
+        cmd = command() if callable(command) else None
+        snapshot = antigravity_quota.peek_quota(
+            cmd if isinstance(cmd, str) else None,
+            max_age_s=antigravity_quota.FOOTER_MAX_AGE_S,
+        )
+        if snapshot is None:
+            return msg
+        for line in antigravity_quota.format_quota_footer(
+            snapshot, always_show=always_show
+        ):
+            msg = _insert_footer_line(msg, f"\n{line}")
+        return msg
+    except Exception:  # noqa: BLE001 — cosmetic footer must never block final message
+        logger.debug("usage_footer.failed", exc_info=True)
+        return msg
+
+
+# #979: engine → its subscription-usage footer. The keys are
+# ``SUBSCRIPTION_USAGE_SUPPORTED_ENGINES`` (which also shows the /config
+# toggle). Each entry looks its function up when called, so Claude's is the
+# same call as before the dispatch: ``_maybe_append_usage_footer(msg,
+# always_show=…)``.
+SUBSCRIPTION_FOOTERS: dict[str, Callable[..., Awaitable[RenderedMessage]]] = {
+    "claude": lambda msg, *, always_show, runner: _maybe_append_usage_footer(
+        msg, always_show=always_show
+    ),
+    "antigravity": lambda msg, *, always_show, runner: (
+        _maybe_append_antigravity_quota_footer(
+            msg, always_show=always_show, runner=runner
+        )
+    ),
+}
+
+
+async def _append_subscription_footer(
+    runner: Any, msg: RenderedMessage, footer_cfg: Any = None
+) -> RenderedMessage:
+    """Append the engine's subscription-usage footer, if it has one.
+
+    ``[footer] show_subscription_usage`` (then the chat's override) picks
+    the always-on compact line; without it only the warnings show."""
+    footer = SUBSCRIPTION_FOOTERS.get(runner.engine)
+    if footer is None:
+        return msg
+    if footer_cfg is None:
+        footer_cfg = _load_footer_settings()
+    from .runners.run_options import get_run_options
+
+    run_opts = get_run_options()
+    show_sub = footer_cfg.show_subscription_usage
+    if run_opts and run_opts.show_subscription_usage is not None:
+        show_sub = run_opts.show_subscription_usage
+    return await footer(msg, always_show=show_sub, runner=runner)
 
 
 def _apply_cost_delta(
@@ -5340,25 +5413,30 @@ async def run_runner_with_cancel(
             async def wait_cancel(task: RunningTask) -> None:
                 await task.cancel_requested.wait()
                 outcome.cancelled = True
-                if task.resume is not None and task.resume.engine == "claude":
+                # #977: the engine's live-session backend (None: the engine
+                # keeps no process live, so there is nothing to close).
+                live = (
+                    live_backend(task.resume.engine)
+                    if task.resume is not None
+                    else None
+                )
+                if task.resume is not None and live is not None and live.supports_steer:
                     # #775: no steer may land in a run being cancelled — it
                     # would be killed with the process. Later messages fall
                     # back to the queue path (and --resume).
-                    from .runners.claude import close_steer_window
-
-                    await close_steer_window(task.resume.value, "cancel")
+                    await live.close_steer_window(task.resume.value, "cancel")
                 # #776: /cancel (or /new) on a live session that is only
                 # holding between turns closes its stdin — the CLI stops its
                 # background tasks and exits cleanly (no SIGTERM, nothing
                 # quarantined). An active turn is still killed as before.
-                if running_task_is_live_idle(task) and task.resume is not None:
-                    from .runners.claude import close_live_session
-
-                    if await close_live_session(
-                        task.resume.value, "cancel", notice=True
-                    ):
-                        with anyio.move_on_after(20):
-                            await runner_finished.wait()
+                if (
+                    running_task_is_live_idle(task)
+                    and task.resume is not None
+                    and live is not None
+                    and await live.close(task.resume.value, "cancel", notice=True)
+                ):
+                    with anyio.move_on_after(20):
+                        await runner_finished.wait()
                 tg.cancel_scope.cancel()
 
             async def thread_pid() -> None:
@@ -5450,12 +5528,26 @@ async def run_runner_with_cancel(
         **_hook_summary_fields(edits.stream),
     )
     if event_count == 0 and not outcome.cancelled:
-        logger.warning(
-            "session.summary.no_events",
-            session_id=outcome.resume.value if outcome.resume else None,
-            engine=runner.engine,
-            duration_seconds=round(duration, 1),
+        # #1047: a refusal answered before anything was meant to start has
+        # no events by design — INFO, with the reason, not a WARNING.
+        plain_block = _plain_prespawn_refusal(
+            outcome.completed.usage if outcome.completed else None
         )
+        if plain_block is not None:
+            logger.info(
+                "session.summary.no_events",
+                session_id=outcome.resume.value if outcome.resume else None,
+                engine=runner.engine,
+                duration_seconds=round(duration, 1),
+                prespawn_blocked=plain_block,
+            )
+        else:
+            logger.warning(
+                "session.summary.no_events",
+                session_id=outcome.resume.value if outcome.resume else None,
+                engine=runner.engine,
+                duration_seconds=round(duration, 1),
+            )
 
     return outcome
 
@@ -5598,11 +5690,10 @@ async def close_idle_live_sessions(
     for _ref, task in unique_running_tasks(running_tasks):
         if not running_task_is_live_idle(task) or task.resume is None:
             continue
-        if task.resume.engine != "claude":
+        live = live_backend(task.resume.engine)
+        if live is None:
             continue
-        from .runners.claude import close_live_session
-
-        if await close_live_session(task.resume.value, reason, notice=True):
+        if await live.close(task.resume.value, reason, notice=True):
             closed += 1
     return closed
 
@@ -5620,6 +5711,8 @@ class _InFlightFollowup:
     session_id: str
     settled: anyio.Event = field(default_factory=anyio.Event)
     written: bool | None = None
+    # #977: the engine whose live session the writer is writing into.
+    engine: str = "claude"
 
 
 # #921: anchors whose write into the live session is still being decided
@@ -5641,10 +5734,13 @@ def register_followup_anchor(
     reply_to: MessageRef,
     placeholder: MessageRef | None,
     in_flight: bool = False,
+    engine: str = "claude",
 ) -> None:
+    """``engine`` is the writer's live-session backend (#977); it names the
+    log namespace and the registry the run-end settle-wait reports on."""
     _FOLLOWUP_ANCHORS[command_uuid] = (session_id, reply_to, placeholder)
     if in_flight:
-        _FOLLOWUP_IN_FLIGHT[command_uuid] = _InFlightFollowup(session_id)
+        _FOLLOWUP_IN_FLIGHT[command_uuid] = _InFlightFollowup(session_id, engine=engine)
 
 
 def settle_followup_anchor(command_uuid: str, *, written: bool) -> None:
@@ -5677,20 +5773,22 @@ async def _await_in_flight_followups(session_id: str) -> None:
         for _, flight in pending:
             await flight.settled.wait()
     for uuid, flight in pending:
+        live = live_backend(flight.engine)
+        ns = f"{live.log_ns if live is not None else flight.engine}.live_session"
         if not flight.settled.is_set():
-            from .runners.claude import get_live_session
-
             # Expected when a newer process owns the session id (#816): the
             # writer is waiting on *that* process, whose router takes it.
             logger.info(
-                "claude.live_session.followup_settle_timeout",
+                f"{ns}.followup_settle_timeout",
                 session_id=session_id,
                 command_uuid=uuid,
-                live_owner_present=get_live_session(session_id) is not None,
+                live_owner_present=(
+                    live is not None and live.get(session_id) is not None
+                ),
             )
         elif not flight.written:
             logger.info(
-                "claude.live_session.followup_requeued",
+                f"{ns}.followup_requeued",
                 session_id=session_id,
                 command_uuid=uuid,
             )
@@ -6409,6 +6507,21 @@ _SESSION_CLEARED_NOTICE = (
     " be resumed, so it was cleared \N{EM DASH} your next message starts a new"
     " session."
 )
+# #1047: pre-spawn refusals (``usage[PRESPAWN_BLOCKED_KEY]``) that are
+# answered with their own text alone, in place of the progress card: no
+# error header, code block or footers, and ``session.summary.no_events`` at
+# INFO, since nothing was meant to start. Antigravity's ``/continue`` with no
+# conversation of this project's own to resume (#1039) is an answer, not a
+# failure. The other pre-spawn refusals (RAM, concurrency, OpenCode 2.x,
+# Antigravity's other blocks) still render as an error card.
+_PLAIN_PRESPAWN_BLOCKS = frozenset({"continue_unresolved"})
+
+
+def _plain_prespawn_refusal(usage: dict[str, Any] | None) -> str | None:
+    """The pre-spawn block reason when the refusal is a plain reply, else
+    None (#1047)."""
+    reason = prespawn_blocked_reason(usage)
+    return reason if reason in _PLAIN_PRESPAWN_BLOCKS else None
 
 
 def _resume_failure_clears_session(
@@ -6529,18 +6642,15 @@ async def handle_message(
     #
     # The wait is condition-based and bounded: it returns the moment the prior
     # owner deregisters, and on timeout we quarantine and go fresh rather than
-    # racing. Claude-only — no other engine has the limbo behaviour, and
-    # `wait_for_session_handoff` is Claude's registry.
-    if resume_token is not None and runner.engine == "claude":
+    # racing. Only for an engine with a live-session backend (#977; Claude
+    # today) — no other engine has the limbo behaviour or a registry of
+    # session owners to wait on.
+    _live = live_backend(runner.engine)
+    if resume_token is not None and _live is not None:
         _ac_cfg = _load_auto_continue_settings()
         if getattr(_ac_cfg, "serialize_session_owner", True):
             try:
-                from untether.runners.claude import (
-                    session_live_bg_count,
-                    wait_for_session_handoff,
-                )
-
-                _handoff = await wait_for_session_handoff(
+                _handoff = await _live.wait_for_handoff(
                     resume_token.value,
                     getattr(_ac_cfg, "session_handoff_timeout_s", 30.0),
                 )
@@ -6552,7 +6662,7 @@ async def handle_message(
                 # condition-based (resolves the instant the owner exits) and
                 # bounded by ``session_handoff_bg_timeout_s``.
                 if _handoff == "timed_out":
-                    _bg_count = session_live_bg_count(resume_token.value)
+                    _bg_count = _live.live_bg_count(resume_token.value)
                     _bg_budget = float(
                         getattr(_ac_cfg, "session_handoff_bg_timeout_s", 600.0)
                     )
@@ -6580,7 +6690,7 @@ async def handle_message(
                                 ),
                                 options=SendOptions(thread_id=incoming.thread_id),
                             )
-                        _handoff = await wait_for_session_handoff(
+                        _handoff = await _live.wait_for_handoff(
                             resume_token.value, _bg_budget
                         )
             except Exception:  # noqa: BLE001 — never block message handling
@@ -6823,7 +6933,8 @@ async def handle_message(
 
     # ── #777 live background-task status ──────────────────────────────────
     def _bg_tasks() -> list[Any]:
-        # The run's own native task map (Claude); empty for other engines.
+        # The run's own native task map (Claude, and Antigravity since #978);
+        # empty for engines whose state has none.
         tasks = getattr(getattr(edits.stream, "engine_state", None), "tasks", None)
         return list(tasks.values()) if isinstance(tasks, dict) else []
 
@@ -7070,6 +7181,22 @@ async def handle_message(
             and run_ok is False
             and resume_token is not None
             and on_resume_failed is not None
+            and resume_token.is_continue
+        ):
+            # #1039: a /continue token names no session — the engine (or, for
+            # Antigravity, its last-conversations file) picked one. Its
+            # failure says nothing about the chat's saved session, which
+            # ``on_resume_failed`` would clear by engine.
+            logger.info(
+                "session.auto_clear_skipped",
+                reason="continue_token",
+                engine=resume_token.engine,
+            )
+        elif (
+            turn is None
+            and run_ok is False
+            and resume_token is not None
+            and on_resume_failed is not None
         ):
             if _resume_failure_clears_session(
                 resume_token.engine, completed.usage, run_error
@@ -7094,7 +7221,16 @@ async def handle_message(
                     resume=resume_token.value,
                 )
 
-        if run_ok is False and run_error:
+        # #1047: a refusal that is an answer, not a failure — its text alone.
+        plain_refusal = (
+            turn is None
+            and run_ok is False
+            and bool(run_error)
+            and _plain_prespawn_refusal(completed.usage) is not None
+        )
+        if plain_refusal:
+            final_answer = str(run_error)
+        elif run_ok is False and run_error:
             raw_error = str(run_error)
             # #887: the hint depends on why the session ended and on whether
             # the run had any turns, not just on the error text.
@@ -7429,16 +7565,16 @@ async def handle_message(
                 final_rendered, _unattended_footer(unattended)
             )
 
-        # Append usage footer for Claude Code engine runs
-        if runner.engine == "claude":
-            _show_sub = footer_cfg.show_subscription_usage
-            if (
-                _footer_run_opts
-                and _footer_run_opts.show_subscription_usage is not None
-            ):
-                _show_sub = _footer_run_opts.show_subscription_usage
-            final_rendered = await _maybe_append_usage_footer(
-                final_rendered, always_show=_show_sub
+        if plain_refusal:
+            # #1047: the refusal's own text replaces the card — no header,
+            # resume line or footers (nothing ran), and no Cancel button.
+            final_rendered = RenderedMessage(
+                text=final_answer, extra={"reply_markup": {"inline_keyboard": []}}
+            )
+        else:
+            # Append the engine's subscription-usage footer (Claude, Antigravity)
+            final_rendered = await _append_subscription_footer(
+                runner, final_rendered, footer_cfg
             )
 
         logger.debug(
@@ -7640,13 +7776,12 @@ async def handle_message(
     live_notices: dict[str, bool] = {"subscribed": False, "all": False}
 
     def _subscribe_live_notices(sid: ResumeToken | None) -> None:
-        if live_notices["subscribed"] or sid is None or runner.engine != "claude":
+        if live_notices["subscribed"] or sid is None:
             return
-        from .runners.claude import add_live_session_listener
-
-        live_notices["subscribed"] = add_live_session_listener(
-            sid.value, _on_live_notice
-        )
+        live = live_backend(runner.engine)
+        if live is None:
+            return
+        live_notices["subscribed"] = live.add_listener(sid.value, _on_live_notice)
 
     async def _on_live_died(payload: dict[str, Any]) -> None:
         """#1001: the idle live session's process died without a close by
@@ -8457,18 +8592,8 @@ async def handle_message(
                 answer=err_body,
             )
 
-            # Append usage footer for Claude Code engine runs (even on error)
-            if runner.engine == "claude":
-                footer_cfg = _load_footer_settings()
-                from .runners.run_options import get_run_options
-
-                _err_run_opts = get_run_options()
-                _show_sub = footer_cfg.show_subscription_usage
-                if _err_run_opts and _err_run_opts.show_subscription_usage is not None:
-                    _show_sub = _err_run_opts.show_subscription_usage
-                final_rendered = await _maybe_append_usage_footer(
-                    final_rendered, always_show=_show_sub
-                )
+            # Append the engine's subscription-usage footer (even on error)
+            final_rendered = await _append_subscription_footer(runner, final_rendered)
 
             logger.debug(
                 "handle.error.rendered",

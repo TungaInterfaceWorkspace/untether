@@ -1541,6 +1541,78 @@ async def test_838_prespawn_block_does_not_clear_saved_session() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("engine", "blocked"),
+    [
+        (CODEX_ENGINE, "concurrency"),
+        ("claude", "ram"),
+        ("opencode", "unsupported_version"),
+        ("antigravity", "no_project"),
+        ("antigravity", "invalid_argument"),
+    ],
+)
+async def test_1047_other_prespawn_blocks_keep_the_error_card(
+    engine: str, blocked: str
+) -> None:
+    """#1047 made only Antigravity's ``/continue`` refusal a plain reply;
+    every other pre-spawn block still renders as an error card and warns."""
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [ErrorReturn(error="🛑 refused", usage={"prespawn_blocked": blocked})],
+        engine=engine,
+    )
+    with capture_logs() as logs:
+        await handle_message(
+            ExecBridgeConfig(
+                transport=transport, presenter=MarkdownPresenter(), final_notify=True
+            ),
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+            resume_token=None,
+        )
+    final = transport.send_calls[-1]["message"].text
+    assert final.startswith(f"error · {engine}")
+    assert "```\n🛑 refused\n```" in final
+    (summary,) = [r for r in logs if r.get("event") == "session.summary.no_events"]
+    assert summary["log_level"] == "warning"
+    assert "prespawn_blocked" not in summary
+
+
+@pytest.mark.anyio
+async def test_1047_continue_refusal_is_plain_on_the_bridge() -> None:
+    """The bridge side of #1047, engine-neutral: the reason alone decides."""
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            ErrorReturn(
+                error="No conversation yet.",
+                usage={"prespawn_blocked": "continue_unresolved"},
+            )
+        ],
+        engine="antigravity",
+    )
+    with capture_logs() as logs:
+        await handle_message(
+            ExecBridgeConfig(
+                transport=transport, presenter=MarkdownPresenter(), final_notify=True
+            ),
+            runner=runner,
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+            resume_token=None,
+        )
+    progress, final = transport.send_calls
+    assert final["message"].text == "No conversation yet."
+    assert final["options"].replace == progress["ref"]
+    (summary,) = [r for r in logs if r.get("event") == "session.summary.no_events"]
+    assert summary["log_level"] == "info"
+    assert summary["prespawn_blocked"] == "continue_unresolved"
+
+
+@pytest.mark.anyio
 async def test_on_resume_failed_not_called_when_not_resumed() -> None:
     """Callback does not fire for new sessions (resume_token=None)."""
     transport = FakeTransport()
@@ -1570,7 +1642,11 @@ async def test_on_resume_failed_not_called_when_not_resumed() -> None:
 
 
 async def _run_failed_resume_952(
-    engine: str, error: str, usage: dict[str, Any] | None = None
+    engine: str,
+    error: str,
+    usage: dict[str, Any] | None = None,
+    *,
+    is_continue: bool = False,
 ) -> tuple[list[ResumeToken], list[str], list[dict[str, Any]]]:
     transport = FakeTransport()
     runner = ScriptRunner(
@@ -1591,7 +1667,11 @@ async def _run_failed_resume_952(
             cfg,
             runner=runner,
             incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
-            resume_token=ResumeToken(engine=engine, value="healthy-session"),
+            resume_token=(
+                ResumeToken(engine=engine, value="", is_continue=True)
+                if is_continue
+                else ResumeToken(engine=engine, value="healthy-session")
+            ),
             on_resume_failed=on_resume_failed,
         )
     texts = [c["message"].text for c in transport.send_calls] + [
@@ -1666,6 +1746,34 @@ async def test_952_reported_turns_win_over_error_text() -> None:
         "codex", "no rollout found", usage={"num_turns": 2}
     )
     assert cleared == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("engine", "error", "usage"),
+    [
+        ("antigravity", "Antigravity conversation not found", None),
+        ("codex", "thread/resume failed: no rollout found for thread id x", None),
+        ("opencode", 'NotFoundError data: {message: "Session not found: ses_x"}', None),
+        ("pi", "pi failed (rc=1).\nNo session found matching 'zzzz'", None),
+        ("claude", "No conversation found to continue", None),
+        ("claude", "claude failed (rc=1).", {"num_turns": 0}),
+    ],
+)
+async def test_1039_failed_continue_keeps_the_saved_session(
+    engine: str, error: str, usage: dict[str, Any] | None
+) -> None:
+    """#1039: a /continue token names no session, so its failure never clears
+    the chat's saved one (the callback clears by engine) or says it did."""
+    cleared, texts, logs = await _run_failed_resume_952(
+        engine, error, usage, is_continue=True
+    )
+
+    assert cleared == []
+    skipped = [r for r in logs if r.get("event") == "session.auto_clear_skipped"]
+    assert skipped and skipped[0]["reason"] == "continue_token"
+    assert not [r for r in logs if r.get("event") == "session.auto_cleared"]
+    assert not any("couldn't be resumed" in t for t in texts)
 
 
 # ---------------------------------------------------------------------------
@@ -2041,6 +2149,298 @@ async def test_antigravity_run_never_spawns_quota_fetch(monkeypatch, tmp_path) -
     final_text = transport.send_calls[-1]["message"].text
     assert "OK" in final_text
     assert not [e for e in logs if str(e["event"]).startswith("antigravity.quota")]
+
+
+# ===========================================================================
+# #979: Antigravity `~N% ctx` end to end (fake agy → header → log)
+# ===========================================================================
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("scenario", "header_tail", "logged"),
+    [
+        # agy echoed --model in init → 7,102 of the published 1,048,576
+        ("context_model_flag", " · ~1% ctx", 1),
+        # no model named in the stream → no percentage at all
+        ("context_turn", None, None),
+    ],
+)
+async def test_antigravity_final_header_context_pct(
+    monkeypatch, tmp_path, scenario: str, header_tail: str | None, logged: int | None
+) -> None:
+    from pathlib import Path
+
+    from untether.runners.antigravity import AntigravityRunner
+    from untether.utils.paths import reset_run_base_dir, set_run_base_dir
+
+    monkeypatch.setenv("UNTETHER_FAKE_AGY_SCENARIO", scenario)
+    fake = Path(__file__).parent / "fake_clis" / "fake_agy.py"
+    project = tmp_path / "proj"
+    project.mkdir()
+    token = set_run_base_dir(project)
+    transport = FakeTransport()
+    try:
+        with structlog.testing.capture_logs() as logs:
+            await handle_message(
+                ExecBridgeConfig(
+                    transport=transport,
+                    presenter=MarkdownPresenter(),
+                    final_notify=True,
+                ),
+                runner=AntigravityRunner(antigravity_cmd=str(fake)),
+                incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+                resume_token=None,
+            )
+    finally:
+        reset_run_base_dir(token)
+    header = transport.send_calls[-1]["message"].text.splitlines()[0]
+    assert header.startswith("done · antigravity · ")
+    (completed,) = [e for e in logs if e["event"] == "runner.completed"]
+    if header_tail is None:
+        assert "ctx" not in header
+        assert "context_pct" not in completed
+    else:
+        assert header.endswith(header_tail)
+        assert completed["context_pct"] == logged
+    # the summed result figure still feeds the token ledger, untouched
+    assert completed["input_tokens"] == (7102 if logged else 42593)
+
+
+# ===========================================================================
+# #979: subscription-footer dispatch (Claude unchanged; agy peeks, never spawns)
+# ===========================================================================
+
+
+def _force_subscription_footer(monkeypatch, *, show: bool) -> None:
+    from untether.settings import FooterSettings
+
+    monkeypatch.setattr(
+        "untether.runner_bridge._load_footer_settings",
+        lambda: FooterSettings(show_api_cost=False, show_subscription_usage=show),
+    )
+
+
+def _agy_quota_data(*, five_hour_left: float = 1.0, weekly_left: float = 1.0) -> dict:
+    return {
+        "groups": [
+            {
+                "name": "Gemini Models",
+                "buckets": [
+                    {
+                        "id": "gemini-weekly",
+                        "window": "weekly",
+                        "remaining_fraction": weekly_left,
+                        "reset_time": "2099-01-08T00:00:00Z",
+                    },
+                    {
+                        "id": "gemini-5h",
+                        "window": "5h",
+                        "remaining_fraction": five_hour_left,
+                        "reset_time": "2099-01-01T00:00:00Z",
+                    },
+                ],
+            }
+        ]
+    }
+
+
+async def _seed_agy_quota(monkeypatch, data: dict) -> None:
+    """Fill agy's quota cache the way ``/usage`` does, then make every
+    further agy spawn an assertion failure."""
+    from untether.utils import antigravity_quota
+
+    async def seed(runner: Any, command: str, **kwargs: Any) -> dict:
+        return data
+
+    monkeypatch.setattr(antigravity_quota, "run_agy_slash", seed)
+    await antigravity_quota.get_quota(SimpleNamespace(command=lambda: "agy"))
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a final must never start agy for the footer")
+
+    monkeypatch.setattr(antigravity_quota, "run_agy_slash", boom)
+    monkeypatch.setattr(antigravity_quota, "get_quota", boom)
+    monkeypatch.setattr(antigravity_quota, "get_credits", boom)
+
+
+async def _agy_final_text(*, error: bool = False) -> str:
+    transport = FakeTransport()
+    step = Raise(RuntimeError("boom")) if error else Return(answer="done")
+    await handle_message(
+        ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        runner=ScriptRunner(
+            [step], engine=AGY_ENGINE, resume_value=f"agy-979-{uuid.uuid4().hex[:8]}"
+        ),
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=None,
+    )
+    return _last_final_text(transport, error=error)
+
+
+def _last_final_text(transport: "FakeTransport", *, error: bool) -> str:
+    # an error final is an edit of the progress message; a success is a send
+    calls = transport.edit_calls if error else transport.send_calls
+    return calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("show", [True, False])
+@pytest.mark.parametrize("error", [False, True])
+async def test_subscription_footer_dispatch_claude_identical(
+    monkeypatch, show: bool, error: bool
+) -> None:
+    """Claude's footer is the same function with the same arguments as
+    before the dispatch, on a success and on an error final."""
+    import untether.runner_bridge as rb
+
+    calls: list[tuple[str, bool]] = []
+
+    async def recorder(
+        msg: RenderedMessage, *, always_show: bool = False
+    ) -> RenderedMessage:
+        calls.append((msg.text, always_show))
+        return RenderedMessage(text=msg.text + "\nFOOTER", extra=msg.extra)
+
+    monkeypatch.setattr(rb, "_maybe_append_usage_footer", recorder)
+    _force_subscription_footer(monkeypatch, show=show)
+    transport = FakeTransport()
+    step = Raise(RuntimeError("boom")) if error else Return(answer="done")
+    await handle_message(
+        ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        runner=ScriptRunner([step], engine="claude", resume_value="sid-979"),
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=None,
+    )
+    assert [always for _, always in calls] == [show]
+    assert _last_final_text(transport, error=error).endswith("\nFOOTER")
+
+
+@pytest.mark.anyio
+async def test_subscription_footer_run_option_overrides_the_setting(
+    monkeypatch,
+) -> None:
+    import untether.runner_bridge as rb
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    seen: list[bool] = []
+
+    async def recorder(
+        msg: RenderedMessage, *, always_show: bool = False
+    ) -> RenderedMessage:
+        seen.append(always_show)
+        return msg
+
+    monkeypatch.setattr(rb, "_maybe_append_usage_footer", recorder)
+    _force_subscription_footer(monkeypatch, show=False)
+    with apply_run_options(EngineRunOptions(show_subscription_usage=True)):
+        await handle_message(
+            ExecBridgeConfig(
+                transport=FakeTransport(),
+                presenter=MarkdownPresenter(),
+                final_notify=True,
+            ),
+            runner=ScriptRunner(
+                [Return(answer="done")], engine="claude", resume_value="sid-979b"
+            ),
+            incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+            resume_token=None,
+        )
+    assert seen == [True]
+
+
+@pytest.mark.anyio
+async def test_subscription_footer_other_engines_get_none(monkeypatch) -> None:
+    import untether.runner_bridge as rb
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no subscription footer for this engine")
+
+    monkeypatch.setattr(rb, "_maybe_append_usage_footer", boom)
+    monkeypatch.setattr(rb, "_maybe_append_antigravity_quota_footer", boom)
+    _force_subscription_footer(monkeypatch, show=True)
+    transport = FakeTransport()
+    await handle_message(
+        ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        runner=ScriptRunner(
+            [Return(answer="done")], engine=CODEX_ENGINE, resume_value="sid-979c"
+        ),
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="go"),
+        resume_token=None,
+    )
+    assert "done" in transport.send_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error", [False, True])
+async def test_antigravity_footer_peek_only_never_spawns(
+    monkeypatch, error: bool
+) -> None:
+    """REVIEW M8: the agy footer shows what ``/usage`` cached and never
+    waits on a spawn."""
+    await _seed_agy_quota(monkeypatch, _agy_quota_data(five_hour_left=0.88))
+    _force_subscription_footer(monkeypatch, show=True)
+    text = await _agy_final_text(error=error)
+    assert "⚡ Gemini Models 5h: 12% | wk: 0%" in text
+
+
+@pytest.mark.anyio
+async def test_antigravity_footer_nothing_cached_leaves_the_final_alone(
+    monkeypatch,
+) -> None:
+    from untether.utils import antigravity_quota
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a final must never start agy for the footer")
+
+    monkeypatch.setattr(antigravity_quota, "run_agy_slash", boom)
+    _force_subscription_footer(monkeypatch, show=True)
+    text = await _agy_final_text()
+    assert "5h:" not in text and "⚡" not in text
+
+
+@pytest.mark.anyio
+async def test_antigravity_footer_ignores_a_stale_cache(monkeypatch) -> None:
+    from untether.utils import antigravity_quota
+
+    await _seed_agy_quota(monkeypatch, _agy_quota_data(five_hour_left=0.1))
+    cmd, fetched_at, groups = antigravity_quota._QUOTA_CACHE._value
+    antigravity_quota._QUOTA_CACHE._value = (
+        cmd,
+        fetched_at - antigravity_quota.FOOTER_MAX_AGE_S - 1,
+        groups,
+    )
+    _force_subscription_footer(monkeypatch, show=True)
+    text = await _agy_final_text()
+    assert "5h:" not in text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("five_hour_left", "expected"),
+    [
+        (0.5, None),
+        (0.28, "⚡ Gemini Models 5h: 72% ("),
+        (0.05, "⚠️ Gemini Models 5h: 95% ("),
+        (0.0, "\U0001f6d1 Gemini Models 5h limit hit — resets in "),
+    ],
+)
+async def test_antigravity_footer_warns_at_claudes_thresholds(
+    monkeypatch, five_hour_left: float, expected: str | None
+) -> None:
+    await _seed_agy_quota(monkeypatch, _agy_quota_data(five_hour_left=five_hour_left))
+    _force_subscription_footer(monkeypatch, show=False)
+    text = await _agy_final_text()
+    if expected is None:
+        assert "Gemini Models" not in text
+    else:
+        assert expected in text
 
 
 # ===========================================================================

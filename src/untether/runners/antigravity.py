@@ -38,7 +38,7 @@ import signal
 import subprocess
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +46,15 @@ import anyio
 import msgspec
 
 from ..backends import EngineBackend, EngineConfig
+from ..background_status import escape_markdown
+from ..background_tasks import EngineBackgroundTask
 from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
+from ..markdown import HARD_BREAK
 from ..model import (
     Action,
+    ActionEvent,
     ActionKind,
     CompletedEvent,
     EngineId,
@@ -66,7 +70,7 @@ from ..runner import (
     _session_label,
 )
 from ..schemas import antigravity as agy_schema
-from ..utils import antigravity_quota, antigravity_scan
+from ..utils import antigravity_context, antigravity_quota, antigravity_scan
 from ..utils.antigravity_redact import redact_agy_text
 from ..utils.antigravity_state import (
     NOTICES_FILENAME,
@@ -74,7 +78,11 @@ from ..utils.antigravity_state import (
     NoticeStore,
     SeenConfigStore,
 )
-from ..utils.paths import get_run_base_dir, get_run_channel_id
+from ..utils.paths import (
+    get_run_base_dir,
+    get_run_channel_id,
+    get_run_trigger_source,
+)
 from .run_options import ANTIGRAVITY_PERMISSION_MODES, get_run_options
 from .tool_actions import tool_input_path, tool_kind_and_title
 
@@ -134,6 +142,35 @@ NO_PROJECT_TEXT = (
     "can edit files there."
 )
 NO_PROJECT_BLOCK = "no_project"
+# /continue (#1039): agy's own ``--continue`` also resumes a parent or child
+# directory's conversation, so Untether looks this directory up itself
+# (``utils/antigravity_continue.py``) and refuses when there is nothing it
+# can trust.
+NO_CONVERSATION_TEXT = (
+    "No Antigravity conversation for this project yet — send a normal message "
+    "to start one."
+)
+CONTINUE_SHARED_TEXT = (
+    "Antigravity's most recent conversation in this folder has also been run "
+    "from another folder, so Untether can't tell which project it belongs to "
+    "and didn't resume it. Send a normal message instead, or reply to a "
+    "resume line to carry on a particular conversation."
+)
+# The id came from agy's own record, never from the chat, so this neither
+# matches ``runner_bridge._RESUME_FAILURE_RE`` nor claims a session was
+# cleared: the chat's saved conversation is a different one and is kept.
+CONTINUE_GONE_TEXT = (
+    "The conversation Antigravity had recorded for this project no longer "
+    "exists, so nothing was resumed. Send a normal message to carry on from "
+    "this chat's own conversation or start a new one, or reply to a resume "
+    "line to pick a particular conversation."
+)
+CONTINUE_UNREADABLE_TEXT = (
+    "Untether couldn't read Antigravity's record of recent conversations, so "
+    "/continue didn't resume anything. Send a normal message instead, or "
+    "reply to a resume line to carry on a particular conversation."
+)
+CONTINUE_BLOCK = "continue_unresolved"
 INVALID_ARGUMENT_BLOCK = "invalid_argument"
 # A model or conversation id that agy could read as a flag
 # (``utils/antigravity_argv.py``): refused before anything spawns.
@@ -343,18 +380,25 @@ _BACKGROUND_TOOLS = frozenset({"run_command", "schedule", "manage_task"})
 # most 30 min (1.2.9); past that + 60 s grace the wait is no longer expected
 # and ordinary liveness / stall handling resumes.
 _AGY_BACKGROUND_CAP_S = 1860.0
-# D33: the stream carries no ``WaitMsBeforeAsync``, so a background-capable
-# step ACTIVE for longer than this is shown as a background row.
+# D33 / P-B6 (#978): agy picks ``WaitMsBeforeAsync`` per ``run_command`` call
+# (5000, 10000 and 0 seen on 1.3.3) but the 1.3.3 stream carries only
+# ``CommandLine``. Where the parameters do carry it, that value decides when
+# the command counts as background; otherwise it does after this long.
 _BACKGROUND_TITLE_AFTER_S = 5.0
+_ASYNC_WAIT_MAX_MS = 600_000
 _BACKGROUND_TITLE_CHARS = 120
+# Finished entries are dropped from the task map beyond this many.
+_TASKS_MAX = 64
 # Descendant PIDs handed to the #590 teardown sweep: bounded, and each one
 # pinned by its /proc start time so a recycled PID is never signalled.
 _ORPHAN_SNAPSHOT_MAX = 256
 _DESCENDANT_SCAN_MAX = 1024
 # Phase 05 (D29): a model id that already names its effort
 # (``gemini-3.8-flash-high``); agy refuses a different ``--effort`` with it.
-_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
+_EFFORT_SUFFIX_RE = antigravity_context.EFFORT_SUFFIX_RE
 _MODEL_ROW_CHARS = 80
+# #979: the ``telemetry`` action behind the header's ``~N% ctx``.
+_CONTEXT_ACTION_ID = "antigravity.context"
 
 _OUTPUT_PREVIEW_CHARS = 500
 _ERROR_MESSAGE_CHARS = 300
@@ -481,6 +525,10 @@ _GATE_MODE_NAMES = {"ask": "Ask me", "plan": "Plan first"}
 # invents — fails closed: the label would otherwise promise "no shell".
 _WORKSPACE_TOOL_PERMISSIONS = frozenset({"request-review", "strict"})
 CONFIG_UNCHECKED_BLOCK = "config_unchecked"
+# #1044: neither the ``-p /config`` check nor ``init`` gave a usable value.
+TOOL_PERMISSION_UNKNOWN_BLOCK = "tool_permission_unknown"
+_CHECK_FAILED = "the check failed"
+_NO_VALUE = "it returned no toolPermission value"
 
 
 def permission_override_message(value: str) -> str:
@@ -492,6 +540,47 @@ def permission_override_message(value: str) -> str:
 
 
 ALWAYS_PROCEED_TEXT = permission_override_message("always-proceed")
+
+# #1044. Two checks read agy's tool-permission value: ``agy -p /config``
+# before the run and ``init.permission_mode`` in the stream. Either may be
+# unavailable on its own (attended runs go on, with a ⚠️ row); both together
+# stop a Workspace run, and an unattended one is held on the first alone.
+PERMISSION_UNCONFIRMED_TEXT = (
+    "Untether couldn't confirm agy's tool-permission setting: the check "
+    "before the run didn't give one and agy didn't report one when it "
+    "started. Workspace mode won't run without it — try again in a few "
+    "minutes, or pick Full access in /config. If it keeps happening, agy may "
+    "have changed; check for an Untether update."
+)
+
+
+def permission_unknown_held_message(reason: str) -> str:
+    return (
+        "Untether couldn't read agy's tool-permission setting before this run "
+        f"({reason}), so this scheduled run is held. Nothing needs changing: "
+        "Untether checks again on the next run, and the schedule works once "
+        "the check succeeds."
+    )
+
+
+def permission_precheck_unknown_row(reason: str, reported: str) -> str:
+    row = (
+        "⚠️ Untether couldn't read agy's tool-permission setting before this "
+        f"run ({reason}). agy reported {reported} when it started, so the run "
+        "continues."
+    )
+    if reason == _CHECK_FAILED:
+        row += " agy's allow rules and outside-project access weren't checked."
+    return row
+
+
+def permission_unreported_row(checked: str) -> str:
+    return (
+        "⚠️ agy didn't report its permission mode when it started, so this "
+        "run relies on the check Untether made before it (toolPermission: "
+        f"{checked})."
+    )
+
 
 _UNKNOWN_MODE_WARNED: set[str] = set()
 _UNATTENDED_DOWNGRADE_WARNED: set[tuple[str, str]] = set()
@@ -612,17 +701,20 @@ def _paths_text(paths: list[str], limit: int = 5) -> str:
 def config_changed_message(paths: list[str]) -> str:
     return (
         "agy's workspace config changed since someone last ran Antigravity in "
-        f"this chat's project ({_paths_text(paths)}). Send any message in the "
-        "chat to review it; the schedule runs again after that."
+        f"this chat's project ({_paths_text(paths)}), so this scheduled run is "
+        "held. The next message someone sends in the chat will run with the "
+        "changed config and show what changed in a ⚠️ row; the schedule runs "
+        "again after that. Check those files first if you didn't change them."
     )
 
 
 def config_unchecked_message(reason: str) -> str:
     return (
         "Untether couldn't check agy's hooks, plugins and MCP servers in this "
-        f"chat's project ({reason}), so this scheduled run is held. Send any "
-        "message in the chat to look at the project, or trim its .agents/ "
-        "folder."
+        f"chat's project ({reason}), so scheduled runs are held until a check "
+        "succeeds. A message sent in the chat still runs, with a ⚠️ row saying "
+        "the config wasn't checked; trimming the project's .agents/ folder "
+        "usually lets the check finish."
     )
 
 
@@ -661,6 +753,9 @@ class _RunPrecheck:
     config_rows: list[tuple[str, str]] = field(default_factory=list)
     label_suffix: str = ""
     auth_route: str = "oauth"
+    # #1044 (Workspace only): why the check before the run gave no usable
+    # ``toolPermission``; None when it gave one (``config.tool_permission``).
+    permission_unknown: str | None = None
 
 
 # Set by ``run_impl`` right before it delegates to the base ``run_impl``,
@@ -668,6 +763,24 @@ class _RunPrecheck:
 _PRECHECK: contextvars.ContextVar[_RunPrecheck | None] = contextvars.ContextVar(
     "untether_agy_precheck", default=None
 )
+# #1039: same hand-off — whether this run's conversation id was looked up for
+# /continue (``AntigravityStreamState.from_continue``).
+_FROM_CONTINUE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "untether_agy_from_continue", default=False
+)
+
+
+def _conversation_gone_text(state: AntigravityStreamState) -> str:
+    return CONTINUE_GONE_TEXT if state.from_continue else CONVERSATION_GONE_TEXT
+
+
+def _gone_resume(state: AntigravityStreamState) -> ResumeToken | None:
+    """The token on a "conversation no longer exists" reply: the id the chat
+    asked for, or none when /continue looked it up (no resume line for an id
+    the chat never named)."""
+    if state.from_continue or not state.expected_resume:
+        return None
+    return ResumeToken(engine=ENGINE, value=state.expected_resume)
 
 
 # ── one-time notices ────────────────────────────────────────────────────────
@@ -706,6 +819,10 @@ def _antigravity_tool_kind_and_title(
         tool = tool_input.get("ToolName") or tool_input.get("tool_name")
         label = "/".join(str(p) for p in (server, tool) if p)
         return "tool", f"mcp: {label}" if label else "mcp tool"
+    if tool_name == "invoke_subagent":
+        # agy 1.3.3: the spawn is a ``tool`` step while ACTIVE; its roles are
+        # in the parameters (P-B1).
+        return "subagent", _subagent_title(_subagent_specs(tool_input, None))
     normalised = _TOOL_NAME_MAP.get(tool_name, tool_name.lower())
     params = dict(tool_input)
     if (
@@ -728,17 +845,60 @@ def _antigravity_tool_kind_and_title(
     )
 
 
-def _subagent_title(info: dict[str, Any] | None) -> str:
-    subagents = info.get("subagents") if isinstance(info, dict) else None
-    first = subagents[0] if isinstance(subagents, list) and subagents else None
-    if isinstance(first, dict):
-        role = first.get("role")
-        type_name = first.get("type_name")
-        if role and type_name:
-            return f"{type_name}: {role}"
-        if role or type_name:
-            return str(role or type_name)
-    return "subagent"
+# One subagent of an ``invoke_subagent`` step: (role, type, child conversation id).
+_SubagentSpec = tuple[str | None, str | None, str | None]
+
+
+def _subagent_specs(params: Any, info: Any) -> list[_SubagentSpec]:
+    """The subagents one ``invoke_subagent`` step names: from
+    ``subagent_info.subagents[]`` when the step has it (DONE on 1.3.3, ACTIVE
+    too on 1.3.1), else from the ACTIVE ``tool_info.parameters.Subagents[]``."""
+    for holder, key, names in (
+        (info, "subagents", ("role", "type_name", "conversation_id")),
+        (params, "Subagents", ("Role", "TypeName", "ConversationId")),
+    ):
+        entries = holder.get(key) if isinstance(holder, dict) else None
+        if not isinstance(entries, list) or not entries:
+            continue
+        specs: list[_SubagentSpec] = []
+        for entry in entries:
+            role, type_name, child = (
+                value if isinstance(value, str) and value else None
+                for value in (
+                    entry.get(name) if isinstance(entry, dict) else None
+                    for name in names
+                )
+            )
+            specs.append((role, type_name, child))
+        return specs
+    return []
+
+
+def _subagent_title(specs: list[_SubagentSpec]) -> str:
+    if not specs:
+        return "subagent"
+    role, type_name, _ = specs[0]
+    if role and type_name:
+        title = f"{type_name}: {role}"
+    else:
+        title = role or type_name or "subagent"
+    return f"{title} +{len(specs) - 1}" if len(specs) > 1 else title
+
+
+def _async_wait_s(params: dict[str, Any]) -> float:
+    """Seconds a ``run_command`` may stay ACTIVE before it counts as
+    background: agy's own per-call values when the stream carries them
+    (``IsDaemon`` → at once, ``WaitMsBeforeAsync``), else the default."""
+    if params.get("IsDaemon") is True:
+        return 0.0
+    raw = params.get("WaitMsBeforeAsync")
+    if (
+        isinstance(raw, int | float)
+        and not isinstance(raw, bool)
+        and 0 <= raw <= _ASYNC_WAIT_MAX_MS
+    ):
+        return raw / 1000.0
+    return _BACKGROUND_TITLE_AFTER_S
 
 
 def _error_text(error: Any) -> str | None:
@@ -764,15 +924,36 @@ def _error_text(error: Any) -> str | None:
 @dataclass(slots=True)
 class AntigravityStreamState:
     """Per-run state. Exposed as ``stream.engine_state`` (08 §2), so attribute
-    names must not collide with the Claude probes the bridge duck-types
-    (``tasks``, ``live_mode``, ``completed_turns`` …)."""
+    names must not collide with the Claude live-session probes the bridge
+    duck-types (``live_mode``, ``completed_turns``, ``turn_open``,
+    ``result_received_at``, ``live_wakeups`` …).
+
+    ``tasks`` is the one deliberate exception (#978): it is the neutral
+    background-task map (``background_tasks.BackgroundTaskView``) that
+    ``runner_bridge._bg_tasks`` renders as the ``⏳ background`` block. Its
+    other readers were checked for that: ``running_task_is_idle_after_result``
+    needs ``live_mode`` first and reads ``holds_session`` (always False
+    here); the orphan-approval lookup is keyed by a Claude agent id; and the
+    post-result status message opens only for live tasks, which the end of a
+    run never leaves."""
 
     factory: EventFactory
     note_seq: int = 0
     session_id: str | None = None  # init / step / result; never ""
     expected_resume: str | None = None  # resume.value when resuming by id
     conversation_missing: bool = False  # G8: init id != the resumed id
-    init_model: str | None = None  # init.model (agy ≥ 1.3.2)
+    # #1039: the id was looked up for /continue, not named by the chat.
+    from_continue: bool = False
+    # init.model: agy ≥ 1.3.2, and only when ``--model`` was passed (it
+    # echoes the flag). Nothing else in the stream names the model.
+    init_model: str | None = None
+    # #979: input side of the latest model call (``agent_response`` usage:
+    # input + cache-read tokens), the ``(pct, window)`` last sent to the
+    # header, and the once-per-run log latches.
+    ctx_used: int | None = None
+    ctx_emitted: tuple[int, int] | None = None
+    ctx_miss_logged: bool = False
+    ctx_over_warned: bool = False
     text_by_step: dict[int, str] = field(default_factory=dict)
     pending_actions: dict[str, Action] = field(default_factory=dict)
     # DONE + empty output + deniable family → verdict unknown until a later
@@ -787,6 +968,15 @@ class AntigravityStreamState:
     orphan_pid_starttimes: dict[int, int] = field(default_factory=dict)
     # Background steps already retitled ``⏳ background: …`` (once each).
     bg_retitled: set[int] = field(default_factory=set)
+    # #978: the rows of the ``⏳ background`` block, built from the stream
+    # only — ``cmd:<step>`` (run_command), ``timer:<step>`` (schedule),
+    # ``sub:<step>:<n>`` (one per subagent of an invoke_subagent step).
+    # Display only: ``bg_steps`` stays the busy probe (D33: a subagent can't
+    # mark a run busy).
+    tasks: dict[str, EngineBackgroundTask] = field(default_factory=dict)
+    # ``system_message`` steps still expected for a finished background
+    # command / timer; those are not a subagent finishing.
+    bg_notices_owed: int = 0
     agy_pid: int | None = None
     # Phase 05: the ``--effort`` level actually passed (footer), and the one
     # ⚠️ row to show when a stored level was dropped for this model.
@@ -807,6 +997,18 @@ class AntigravityStreamState:
     # D22.7: init reported always-proceed without our bypass flag → the run
     # was stopped; every later line is ignored.
     permission_refused: bool = False
+    # #1044: what the check before the run found — the reason it gave no
+    # usable value, or the value itself. Both None only when a test drives
+    # ``translate`` without ``run_impl`` (nothing is asserted then).
+    permission_unknown: str | None = None
+    permission_prechecked: str | None = None
+    # True once ``init`` (or the first step of a stream with no ``init``)
+    # has been checked; the ⚠️ row owed when one of the two checks was missing.
+    permission_checked: bool = False
+    permission_note: str | None = None
+    # ``RunContext.trigger_source``: None when a person's message started the
+    # run. Only then does the run record changed agy config as seen.
+    trigger_source: str | None = None
     # Phase 03 (D27): a stderr line stopped agy (``auth`` / ``account_blocked``
     # / ``quota`` / ``credits`` / ``conversation_gone``); it decides the final
     # text whatever agy's result says.
@@ -899,6 +1101,13 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if refusal is not None:
             yield refusal
             return
+        from_continue = resume is not None and resume.is_continue
+        if from_continue:
+            # #1039: from here on the run is an ordinary resume by id.
+            resume, continue_block = await self._resolve_continue()
+            if continue_block is not None:
+                yield continue_block
+                return
         argv_block = self._invalid_argument_refusal(resume)
         if argv_block is not None:
             yield argv_block
@@ -917,7 +1126,10 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             return
         # Consumed by ``new_state`` inside the base run_impl (same task).
         _PRECHECK.set(precheck)
+        _FROM_CONTINUE.set(from_continue)
         _log_tos_notice_once()
+        # #1045: the ⚠️ rows shown on the progress message, for the final.
+        warnings: list[str] = []
         # Explicit parent ref: zero-arg super() breaks in @dataclass(slots=True).
         async with contextlib.aclosing(
             JsonlSubprocessRunner.run_impl(self, prompt, resume)
@@ -939,7 +1151,12 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     if rows is None:
                         rows = [_recheck_warning("the check timed out")]
                     for row in rows:
+                        _note_warning(warnings, row)
                         yield row
+                if isinstance(evt, CompletedEvent):
+                    evt = _with_warning_block(evt, warnings)
+                else:
+                    _note_warning(warnings, evt)
                 yield evt
 
     def _no_project_refusal(self, resume: ResumeToken | None) -> UntetherEvent | None:
@@ -950,11 +1167,16 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if base is None:
             reason = "no_project"
         else:
-            with contextlib.suppress(OSError):
+            try:
                 resolved = base.resolve()
                 forbidden = {Path("/"), Path.home().resolve(), Path.cwd().resolve()}
                 if resolved in forbidden:
                     reason = "forbidden_dir"
+            except (OSError, RuntimeError):
+                # #1044: a directory that can't be compared can't be cleared.
+                # Python 3.12's ``resolve()`` raises RuntimeError for a
+                # symlink loop (OSError from 3.13).
+                reason = "unresolved_dir"
         if reason is None:
             return None
         logger.warning(
@@ -966,6 +1188,58 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             error=NO_PROJECT_TEXT,
             resume=resume,
             usage={PRESPAWN_BLOCKED_KEY: NO_PROJECT_BLOCK},
+        )
+
+    async def _resolve_continue(
+        self,
+    ) -> tuple[ResumeToken | None, UntetherEvent | None]:
+        """``/continue`` → this directory's own conversation, or a refusal.
+
+        #1039: agy's ``--continue`` also resumes a conversation from a parent
+        or child directory and has no flag to stop that, so the id comes from
+        agy's last-conversations file for the exact run directory (custom:
+        see the register in ``docs/reference/runners/antigravity/runner.md``).
+        Never falls back to ``--continue``.
+        """
+        from ..utils import antigravity_continue
+
+        base = get_run_base_dir()
+        reason = "no_run_dir"
+        if base is not None:
+            try:
+                # Off the event loop: one small, bounded file read.
+                found = await anyio.to_thread.run_sync(
+                    antigravity_continue.lookup_conversation, base
+                )
+            except Exception as exc:  # noqa: BLE001 - never spawn on a surprise
+                logger.warning(
+                    "antigravity.continue.lookup_failed",
+                    error_type=type(exc).__name__,
+                )
+                reason = "lookup_failed"
+            else:
+                if found.conversation_id is not None:
+                    logger.info("antigravity.continue.resolved", base=str(base))
+                    return (
+                        ResumeToken(engine=ENGINE, value=found.conversation_id),
+                        None,
+                    )
+                reason = found.reason
+        if reason in antigravity_continue.MISSING_REASONS:
+            text = NO_CONVERSATION_TEXT
+        elif reason == antigravity_continue.SHARED_ID:
+            text = CONTINUE_SHARED_TEXT
+        else:
+            text = CONTINUE_UNREADABLE_TEXT
+        logger.warning(
+            "antigravity.continue.refused",
+            reason=reason,
+            base=str(base) if base is not None else None,
+        )
+        return None, EventFactory(ENGINE).completed_error(
+            error=text,
+            resume=None,
+            usage={PRESPAWN_BLOCKED_KEY: CONTINUE_BLOCK},
         )
 
     def _invalid_argument_refusal(
@@ -1162,22 +1436,42 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         config = await antigravity_quota.agy_config(self)
         pre.config = config
         pre.auth_route = antigravity_quota.auth_route(config)
-        if config is None:
-            return None, pre
-        if (
-            mode == "workspace"
-            and config.tool_permission
-            and config.tool_permission not in _WORKSPACE_TOOL_PERMISSIONS
-        ):
+        tool_permission = config.tool_permission if config is not None else None
+        if mode == "workspace" and not tool_permission:
+            # #1044: no usable value. An attended run goes on — ``init``
+            # still has to report a safe one (``_check_reported_mode``) —
+            # but nobody reads an unattended run's ⚠️ row, so that is held,
+            # like an unfinished planted-config scan above.
+            pre.permission_unknown = _CHECK_FAILED if config is None else _NO_VALUE
+            if trigger is not None:
+                # WARNING, like the scan hold above: one failed probe on a
+                # frequent cron is not an error report. The in-stream refusal
+                # when ``init`` can't confirm it either stays at ERROR.
+                logger.warning(
+                    "antigravity.permission_mode.unverified",
+                    source="config",
+                    requested=mode,
+                    reason=pre.permission_unknown,
+                    trigger=trigger,
+                )
+                return (
+                    EventFactory(ENGINE).completed_error(
+                        error=permission_unknown_held_message(pre.permission_unknown),
+                        resume=resume,
+                        usage={PRESPAWN_BLOCKED_KEY: TOOL_PERMISSION_UNKNOWN_BLOCK},
+                    ),
+                    None,
+                )
+        elif mode == "workspace" and tool_permission not in _WORKSPACE_TOOL_PERMISSIONS:
             logger.error(
                 "antigravity.permission_mode.mismatch",
                 source="config",
                 requested=mode,
-                reported=config.tool_permission,
+                reported=tool_permission,
             )
             return (
                 EventFactory(ENGINE).completed_error(
-                    error=permission_override_message(config.tool_permission),
+                    error=permission_override_message(str(tool_permission)),
                     resume=resume,
                     usage={PRESPAWN_BLOCKED_KEY: ALWAYS_PROCEED_BLOCK},
                 ),
@@ -1289,7 +1583,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # ``AgyArgvError`` on a bad value; ``run_impl`` refused that run
         # before getting here.
         from ..utils import antigravity_agent
-        from ..utils.antigravity_argv import agy_flag
+        from ..utils.antigravity_argv import AgyArgvError, agy_flag
 
         args = [
             "--input-format",
@@ -1301,11 +1595,13 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             "--disable-slash-commands",
         ]
         if resume is not None:
-            # #817: a /continue token has value "" — check it first.
+            # #1039: agy's own continue flag also resumes a parent or child
+            # directory's conversation, so it is never passed. ``run_impl``
+            # swaps a /continue token (value "", #817) for this directory's
+            # conversation id before getting here.
             if resume.is_continue:
-                args.append("--continue")
-            else:
-                args.append(agy_flag("--conversation", resume.value))
+                raise AgyArgvError("conversation", "unresolved_continue")
+            args.append(agy_flag("--conversation", resume.value))
         model = self._model()
         if model:
             args.append(agy_flag("--model", model))
@@ -1401,6 +1697,8 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         )
         precheck = _PRECHECK.get()
         _PRECHECK.set(None)
+        from_continue = _FROM_CONTINUE.get()
+        _FROM_CONTINUE.set(False)
         options = get_run_options()
         mode = self._effective_mode()
         label = _mode_label(mode)
@@ -1410,11 +1708,21 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         return AntigravityStreamState(
             factory=EventFactory(ENGINE),
             expected_resume=expected or None,
+            from_continue=from_continue,
             resumed=resume is not None,
             effective_mode=mode,
             mode_label=label,
             unattended=options.unattended_trigger if options is not None else None,
             precheck=precheck,
+            permission_unknown=(
+                precheck.permission_unknown if precheck is not None else None
+            ),
+            permission_prechecked=(
+                precheck.config.tool_permission
+                if precheck is not None and precheck.config is not None
+                else None
+            ),
+            trigger_source=get_run_trigger_source(),
         )
 
     def start_run(
@@ -1542,6 +1850,8 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     elapsed_ms=self._kill_elapsed_ms(state),
                     session_id=state.session_id,
                 )
+            if kind == "conversation_gone":
+                return _conversation_gone_text(state)
             return _KILL_TEXT[kind]
         if error and "authentication failed or timed out" in error.lower():
             logger.error("antigravity.auth.failed", session_id=state.session_id)
@@ -1560,9 +1870,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         out = self._settle_open_actions(state, ok=False, message=state.kill_reason)
         if state.kill_reason == "conversation_gone" and state.expected_resume:
             state.conversation_missing = True
-            token: ResumeToken | None = ResumeToken(
-                engine=ENGINE, value=state.expected_resume
-            )
+            token: ResumeToken | None = _gone_resume(state)
             answer = ""
         else:
             token = self._resume_for_completed(state, resume)
@@ -1662,6 +1970,13 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             case agy_schema.StepUpdate(step_update=su):
                 if su is None:
                     return []
+                if not state.permission_checked:
+                    # #1044: a step with no ``init`` before it.
+                    refused = self._check_reported_mode(
+                        state, None, resume, source="no_init"
+                    )
+                    if refused is not None:
+                        return refused
                 out: list[UntetherEvent] = []
                 if su.conversation_id and state.session_id is None:
                     out.extend(self._adopt_session(state, su.conversation_id))
@@ -1709,38 +2024,73 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         state: AntigravityStreamState,
         reported: str | None,
         resume: ResumeToken | None,
+        *,
+        source: str = "init",
     ) -> list[UntetherEvent] | None:
         """D22.7: agy's ``toolPermission: always-proceed`` setting stands in
         for the bypass flag. Without our flag, anything but agy's default or
         a stricter policy (fail closed: ``proceed-in-sandbox``, a value a
         newer agy invents) stops the run before any tool (``init`` comes
-        ≈ 2.7 s before the first model output). A missing value can't be
-        checked here; the ``-p /config`` check covers that host."""
-        bypass = state.effective_mode == "full"
-        if (
-            not bypass
-            and reported is not None
-            and reported not in _WORKSPACE_TOOL_PERMISSIONS
-        ):
-            state.permission_refused = True
+        ≈ 2.7 s before the first model output).
+
+        #1044: a missing value (a renamed field, or ``source="no_init"`` — a
+        step with no ``init`` before it) is covered by the ``-p /config``
+        check before the run. When that gave no usable value either, nothing
+        has confirmed the setting and the run stops; when only one of the
+        two is missing the run goes on with a ⚠️ row."""
+        state.permission_checked = True
+        state.permission_note = None
+        if state.effective_mode == "full":
+            if reported == "request-review":
+                _warn_bypass_unreported()
+            return None
+        if reported is not None and reported not in _WORKSPACE_TOOL_PERMISSIONS:
             logger.error(
                 "antigravity.permission_mode.mismatch",
                 source="init",
                 requested=state.effective_mode,
                 reported=reported,
             )
-            if state.agy_pid is not None:
-                with contextlib.suppress(OSError):
-                    os.kill(state.agy_pid, signal.SIGTERM)
-            keep = resume if resume is not None and not resume.is_continue else None
-            return [
-                state.factory.completed_error(
-                    error=permission_override_message(reported), resume=keep
-                )
-            ]
-        if bypass and reported == "request-review":
-            _warn_bypass_unreported()
+            return self._refuse_in_stream(
+                state, resume, permission_override_message(reported)
+            )
+        if reported is None and state.permission_unknown is not None:
+            logger.error(
+                "antigravity.permission_mode.unverified",
+                source=source,
+                requested=state.effective_mode,
+                reason=state.permission_unknown,
+            )
+            return self._refuse_in_stream(state, resume, PERMISSION_UNCONFIRMED_TEXT)
+        if reported is None and state.permission_prechecked:
+            state.permission_note = permission_unreported_row(
+                state.permission_prechecked
+            )
+        elif reported is not None and state.permission_unknown is not None:
+            source = "config"
+            state.permission_note = permission_precheck_unknown_row(
+                state.permission_unknown, reported
+            )
+        if state.permission_note is not None:
+            logger.warning(
+                "antigravity.permission_mode.unconfirmed",
+                source=source,
+                requested=state.effective_mode,
+                reported=reported,
+                reason=state.permission_unknown,
+            )
         return None
+
+    def _refuse_in_stream(
+        self, state: AntigravityStreamState, resume: ResumeToken | None, error: str
+    ) -> list[UntetherEvent]:
+        """Stop agy and end the run; every later line is ignored."""
+        state.permission_refused = True
+        if state.agy_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(state.agy_pid, signal.SIGTERM)
+        keep = resume if resume is not None and not resume.is_continue else None
+        return [state.factory.completed_error(error=error, resume=keep)]
 
     def _warning_row(
         self,
@@ -1761,6 +2111,13 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 )
             )
             state.effort_note = None
+        if state.permission_note is not None:
+            out.append(
+                self._warning_row(
+                    state, "antigravity.permission.unconfirmed", state.permission_note
+                )
+            )
+            state.permission_note = None
         pre = state.precheck
         if pre is None:
             return out
@@ -1776,13 +2133,21 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if pre.first_sight and scan is not None:
             pre.first_sight = False
             paths = sorted(scan.agy)
+            # #1044: only a person's message acknowledges the config. An
+            # ``/at`` or loop re-fire (``trigger_source`` set) still runs and
+            # shows the row, but held crons stay held until someone has
+            # been in the chat to see it.
+            recorded = state.trigger_source is None and state.unattended is None
             logger.warning(
                 "antigravity.workspace_config_present",
                 paths=paths[:20],
                 digest=scan.agy_digest[:12],
                 permission_mode=state.effective_mode,
+                recorded=recorded,
+                trigger=state.trigger_source,
             )
-            self._seen().set(scan.root, scan.agy_digest)
+            if recorded:
+                self._seen().set(scan.root, scan.agy_digest)
             out.append(
                 self._warning_row(
                     state,
@@ -1825,8 +2190,11 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             # agy answers SIGTERM with an "interrupted" result (rc 1).
             with contextlib.suppress(OSError):
                 os.kill(state.agy_pid, signal.SIGTERM)
-        old = ResumeToken(engine=ENGINE, value=state.expected_resume)
-        return [state.factory.completed_error(error=CONVERSATION_GONE_TEXT, resume=old)]
+        return [
+            state.factory.completed_error(
+                error=_conversation_gone_text(state), resume=_gone_resume(state)
+            )
+        ]
 
     def _translate_step(
         self, su: agy_schema.StepUpdatePayload, state: AntigravityStreamState
@@ -1844,12 +2212,17 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         step_type = su.step_type
         st = su.state
         terminal = st in {"DONE", "ERROR"}
+        if idx is not None and step_type in {"tool", "subagent", "agent_response"}:
+            self._note_overtaken(state, idx)
 
         if step_type == "tool":
             out.extend(self._translate_tool(su, state, action_id))
             return out
         if step_type == "subagent":
-            title = _subagent_title(su.subagent_info)
+            specs = _subagent_specs(None, su.subagent_info)
+            title = _subagent_title(specs)
+            if idx is not None:
+                self._track_subagents(state, idx, specs, failed=st == "ERROR")
             if not terminal:
                 action = Action(
                     id=action_id,
@@ -1879,6 +2252,8 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 state.text_by_step[idx] = (
                     state.text_by_step.get(idx, "") + su.text_delta
                 )
+            if st == "DONE":
+                out.extend(self._note_context(su.usage, state))
             return out
         # A tool step that turns into another type on completion (the
         # ``finish`` tool with --json-schema goes ACTIVE as ``tool``, DONE as
@@ -1887,12 +2262,90 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             action = state.pending_actions.pop(action_id)
             if idx is not None:
                 state.bg_steps.pop(idx, None)
+                self._task_step_ended(state, idx, ok=st == "DONE")
             out.append(self._complete(action, state, ok=st == "DONE"))
             return out
+        if step_type == "system_message" and terminal:
+            self._note_system_message(state)
         # user_input (incl. a hook-injected one: not a new run), system_message,
         # checkpoint, unknown, finish, anything newer.
         logger.debug("antigravity.step.ignored", step_type=step_type, state=st)
         return out
+
+    # -- context use (#979) ---------------------------------------------------
+
+    @staticmethod
+    def _context_value(
+        state: AntigravityStreamState,
+    ) -> tuple[int, int, str] | None:
+        """``(pct, window, model)`` for the latest model call, or None.
+
+        The model is agy's own ``init.model`` only — never the id Untether
+        would pass or the configured default, which are not proof of what
+        agy ran. The window is the published one from
+        ``utils/antigravity_context.py`` (agy reports none); a model that is
+        not in that table has no percentage."""
+        used = state.ctx_used
+        model = state.init_model
+        if used is None or not model:
+            return None
+        window = antigravity_context.context_window_for(model)
+        if window is None:
+            if not state.ctx_miss_logged:
+                state.ctx_miss_logged = True
+                logger.debug(
+                    "antigravity.context.window_miss",
+                    model=model[:_MODEL_ROW_CHARS],
+                )
+            return None
+        if used > window and not state.ctx_over_warned:
+            state.ctx_over_warned = True
+            logger.warning(
+                "antigravity.context.over_window",
+                session_id=state.session_id,
+                model=model[:_MODEL_ROW_CHARS],
+                used=used,
+                context_window=window,
+            )
+        return antigravity_context.context_pct(used, window), window, model
+
+    def _note_context(
+        self, usage: agy_schema.StepUsage | None, state: AntigravityStreamState
+    ) -> list[UntetherEvent]:
+        """A finished model call's usage is the new context value: its
+        ``input_tokens`` plus ``cache_read_tokens`` (agy reports cache reads
+        apart from the input). ``result.usage`` is never used for this — it
+        sums every call of the turn and, on a resume, the earlier turns.
+
+        Emits the ``telemetry`` action the shared header path reads (#819),
+        only when the shown value changed."""
+        if usage is None or not _is_count(usage.input_tokens):
+            return []
+        used = usage.input_tokens
+        if _is_count(usage.cache_read_tokens):
+            used += usage.cache_read_tokens
+        state.ctx_used = used
+        value = self._context_value(state)
+        if value is None:
+            return []
+        pct, window, model = value
+        if state.ctx_emitted == (pct, window):
+            return []
+        state.ctx_emitted = (pct, window)
+        return [
+            state.factory.action_updated(
+                action_id=_CONTEXT_ACTION_ID,
+                kind="telemetry",
+                title="context",
+                detail={
+                    "context_pct": pct,
+                    "context_used": used,
+                    "context_window": window,
+                    "model": model,
+                    "context_estimated": True,
+                },
+            )
+        ]
 
     def _translate_tool(
         self,
@@ -1920,6 +2373,8 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 self._collect_descendants(state)
             if action_id in state.pending_actions:
                 return []
+            if idx is not None:
+                self._track_tool_started(state, idx, tool_name, params)
             action = Action(id=action_id, kind=kind, title=title, detail=detail)
             state.pending_actions[action_id] = action
             return [
@@ -1929,6 +2384,9 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             ]
         if idx is not None:
             state.bg_steps.pop(idx, None)
+            self._task_step_ended(state, idx, ok=su.state == "DONE")
+            if su.state == "ERROR":
+                self._track_subagents(state, idx, [], failed=True)
         if tool_name == "run_command":
             # By DONE the background child exists (ACTIVE can precede it).
             self._collect_descendants(state)
@@ -2000,20 +2458,189 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         except Exception:  # noqa: BLE001 — diagnostics must not break a run
             logger.debug("antigravity.descendants.scan_failed", exc_info=True)
 
+    # -- #978: the background task map (stream only) --------------------------
+
+    @staticmethod
+    def _add_task(state: AntigravityStreamState, task: EngineBackgroundTask) -> None:
+        if task.task_id in state.tasks:
+            return
+        if len(state.tasks) >= _TASKS_MAX:
+            for tid in [t for t, old in state.tasks.items() if old.status != "running"]:
+                del state.tasks[tid]
+        state.tasks[task.task_id] = task
+
+    def _track_tool_started(
+        self,
+        state: AntigravityStreamState,
+        idx: int,
+        tool_name: str,
+        params: dict[str, Any],
+    ) -> None:
+        """A tool step went ACTIVE: the model has moved on, so a completion
+        notice still expected for an earlier task isn't coming; then register
+        what this step may leave running."""
+        state.bg_notices_owed = 0
+        now = state.bg_steps.get(idx) or time.monotonic()
+        if tool_name == "run_command":
+            # Registered now, listed only from ``background_from``: agy prints
+            # nothing while it holds its answer for an async command (A1), so
+            # no later line could add the row.
+            self._add_task(
+                state,
+                EngineBackgroundTask(
+                    task_id=f"cmd:{idx}",
+                    task_type="local_bash",
+                    description=_strip_cr(str(params.get("CommandLine") or "command")),
+                    started_at=now,
+                    background_from=now + _async_wait_s(params),
+                ),
+            )
+        elif tool_name == "schedule":
+            # P-B2: ACTIVE for the timer's whole life, answer held.
+            seconds = params.get("DurationSeconds")
+            timed = isinstance(seconds, int | float) and not isinstance(seconds, bool)
+            self._add_task(
+                state,
+                EngineBackgroundTask(
+                    task_id=f"timer:{idx}",
+                    task_type="schedule",
+                    description=f"timer ({int(seconds)}s)" if timed else "timer",
+                    started_at=now,
+                ),
+            )
+            logger.info("antigravity.background.started", task_id=f"timer:{idx}")
+        elif tool_name == "invoke_subagent":
+            self._track_subagents(state, idx, _subagent_specs(params, None))
+
+    def _track_subagents(
+        self,
+        state: AntigravityStreamState,
+        idx: int,
+        specs: list[_SubagentSpec],
+        *,
+        failed: bool = False,
+    ) -> None:
+        """One row per subagent of an ``invoke_subagent`` step. The spawn
+        step is DONE in well under a second while the children work on, so
+        only a failed spawn ends them here; each child's end is a parent
+        ``system_message`` (``_note_system_message``)."""
+        now = time.monotonic()
+        for n, (role, type_name, child) in enumerate(specs):
+            key = f"sub:{idx}:{n}"
+            task = state.tasks.get(key)
+            if task is None and not failed:
+                label = f"{role} ({type_name})" if role and type_name else None
+                task = EngineBackgroundTask(
+                    task_id=key,
+                    task_type="local_agent",
+                    description=label or role or type_name or "subagent",
+                    started_at=now,
+                )
+                self._add_task(state, task)
+                logger.info("antigravity.background.started", task_id=key)
+            if task is not None and child:
+                task.ref = child
+        if failed:
+            prefix = f"sub:{idx}:"
+            for key, task in state.tasks.items():
+                if key.startswith(prefix) and task.status == "running":
+                    task.status = "failed"
+                    task.ended_at = now
+
+    @staticmethod
+    def _note_overtaken(state: AntigravityStreamState, idx: int) -> None:
+        """The model went on (a later tool, subagent or reply step) while a
+        ``run_command`` is still ACTIVE: agy runs tool calls one at a time
+        (P-H15), so that command went async (P-B4's daemon) — list it now
+        rather than at its deadline."""
+        for step in state.bg_steps:
+            if step >= idx:
+                continue
+            task = state.tasks.get(f"cmd:{step}")
+            if task is not None and not task.is_backgrounded:
+                task.background_from = None
+
+    @staticmethod
+    def _task_step_ended(state: AntigravityStreamState, idx: int, *, ok: bool) -> None:
+        """The ``run_command`` / ``schedule`` step *idx* reached DONE / ERROR."""
+        for key in (f"cmd:{idx}", f"timer:{idx}"):
+            task = state.tasks.get(key)
+            if task is None or task.status != "running":
+                continue
+            if not task.is_backgrounded:
+                del state.tasks[key]  # finished in the foreground: never a row
+                continue
+            task.status = "completed" if ok else "failed"
+            task.ended_at = time.monotonic()
+            state.bg_notices_owed += 1
+            logger.info(
+                "antigravity.background.finished",
+                task_id=key,
+                status=task.status,
+                elapsed_s=round(task.ended_at - task.started_at, 1),
+            )
+
+    @staticmethod
+    def _note_system_message(state: AntigravityStreamState) -> None:
+        """agy tells the parent about finished background work with one
+        ``system_message`` step each, with no content in the stream (P-B1;
+        the child's id is only in agy's transcript file, which Untether does
+        not read). One owed to a command / timer that just ended is spent on
+        it; otherwise it is a subagent finishing, and with nothing to say
+        which, the oldest running one — first in, first out."""
+        if state.bg_notices_owed > 0:
+            state.bg_notices_owed -= 1
+            return
+        for key, task in state.tasks.items():
+            if task.task_type == "local_agent" and task.status == "running":
+                task.status = "completed"
+                task.ended_at = time.monotonic()
+                logger.info(
+                    "antigravity.background.finished",
+                    task_id=key,
+                    status="completed",
+                    elapsed_s=round(task.ended_at - task.started_at, 1),
+                    attribution="fifo",
+                )
+                return
+
+    @staticmethod
+    def _end_tasks(state: AntigravityStreamState, *, ok: bool) -> None:
+        """The run is over: nothing is listed as running after it. A
+        ``run_command`` still ACTIVE at a successful result is a daemon task
+        agy leaves behind (P-B4) or upstream #1044 — ended, not failed."""
+        now = time.monotonic()
+        left = [key for key, task in state.tasks.items() if task.status == "running"]
+        for key in left:
+            state.tasks[key].status = "ended"
+            state.tasks[key].ended_at = now
+        state.bg_notices_owed = 0
+        outlived = [key for key in left if key.startswith("cmd:")]
+        if ok and outlived:
+            logger.info("antigravity.background.outlived", tasks=outlived)
+
     @staticmethod
     def _background_title_updates(
         state: AntigravityStreamState,
     ) -> list[UntetherEvent]:
-        """08 §6: retitle a background-capable step that has been ACTIVE for
-        more than 5 s as ``⏳ background: <command>``, once, when another
-        stdout line arrives (no timers in the translator). The row closes
-        under its original title."""
+        """08 §6: retitle a background-capable step as ``⏳ background:
+        <command>`` once it counts as background (a ``run_command`` when its
+        task does, #978; the others after 5 s), once, when another stdout
+        line arrives (no timers in the translator). The row closes under its
+        original title."""
         if not state.bg_steps:
             return []
         now = time.monotonic()
         out: list[UntetherEvent] = []
         for idx, since in state.bg_steps.items():
-            if idx in state.bg_retitled or now - since <= _BACKGROUND_TITLE_AFTER_S:
+            if idx in state.bg_retitled:
+                continue
+            task = state.tasks.get(f"cmd:{idx}")
+            if task is not None:
+                due = task.is_backgrounded
+            else:
+                due = now - since > _BACKGROUND_TITLE_AFTER_S
+            if not due:
                 continue
             action = state.pending_actions.get(f"step-{idx}")
             if action is None:
@@ -2070,6 +2697,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         )
         state.pending_actions.clear()
         state.bg_steps.clear()
+        self._end_tasks(state, ok=ok)
         return out
 
     def _answer(self, state: AntigravityStreamState, response: str | None) -> str:
@@ -2307,13 +2935,14 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         )
         return OAUTH_NOTICE_TEXT
 
-    @staticmethod
     def _usage(
-        res: agy_schema.ResultPayload, state: AntigravityStreamState
+        self, res: agy_schema.ResultPayload, state: AntigravityStreamState
     ) -> dict[str, Any]:
         """Flat per-run usage. agy's ``usage`` is session-cumulative (04 turns
         it into a per-run delta); ``num_turns`` / ``duration_seconds`` are
-        cumulative too and never reported (08 §8, #952)."""
+        cumulative too and never reported (08 §8, #952). ``context`` (#979)
+        is the latest model call's context value, for the
+        ``runner.completed`` log."""
         usage: dict[str, Any] = {}
         stats = res.usage
         if stats is not None:
@@ -2329,6 +2958,16 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             }
         if state.t_spawn:
             usage["duration_ms"] = int((time.monotonic() - state.t_spawn) * 1000)
+        context = self._context_value(state)
+        if context is not None:
+            pct, window, model = context
+            usage["context"] = {
+                "pct": pct,
+                "used": state.ctx_used,
+                "window": window,
+                "model": model,
+                "estimated": True,
+            }
         return usage
 
     @staticmethod
@@ -2461,6 +3100,10 @@ def _step_of(action_id: str) -> int:
         return -1
 
 
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _recheck_warning(
     problem: str, factory: EventFactory | None = None
 ) -> UntetherEvent:
@@ -2504,6 +3147,46 @@ def _append_paragraph(answer: str, paragraph: str) -> str:
     if not answer.strip():
         return paragraph
     return f"{answer.rstrip()}\n\n{paragraph}"
+
+
+# ── #1045: ⚠️ rows in the final answer ──────────────────────────────────────
+
+
+def _note_warning(titles: list[str], evt: UntetherEvent) -> None:
+    """Keep a ⚠️ row's text (``_warning_event``'s shape) for the final.
+
+    Left out: a ``⚠️ Blocked`` row, which the denial paragraph already says
+    in the answer (#1037), and the base runner's ✗ notes (``ok=False``:
+    stderr, AGY_ERROR, bad JSON), whose text the error final carries."""
+    if not isinstance(evt, ActionEvent) or evt.phase != "completed":
+        return
+    action = evt.action
+    if action.kind != "warning" or evt.ok is not True or evt.level != "warning":
+        return
+    if action.detail.get("denied"):
+        return
+    title = str(action.title or "").strip()
+    if title and title not in titles:
+        titles.append(title)
+
+
+def final_warning_block(titles: list[str]) -> str | None:
+    """One line per distinct row, escaped: the rows carry project paths."""
+    lines = list(dict.fromkeys(t for t in titles if t))
+    if not lines:
+        return None
+    return HARD_BREAK.join(escape_markdown(line) for line in lines)
+
+
+def _with_warning_block(evt: CompletedEvent, titles: list[str]) -> CompletedEvent:
+    """The progress message carrying the rows is replaced by the final, so
+    the final repeats them after the answer, like the denial paragraph and
+    the OAuth notice (#1045). A person's run records new config as seen, so
+    that person has to have been shown it."""
+    block = final_warning_block(titles)
+    if block is None:
+        return evt
+    return replace(evt, answer=_append_paragraph(evt.answer, block))
 
 
 def build_runner(config: EngineConfig, config_path: Path) -> Runner:

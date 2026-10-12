@@ -91,11 +91,24 @@ When agy finishes, the final message carries the answer, a footer and the resume
   dollars, so there is no cost figure.
 - **The resume line** is what you copy into a terminal to carry on there.
 - **To continue in Telegram**, just send another message in chat mode, or reply to the message. `/continue` picks
-  up the most recent conversation for the project directory, including one you started in a terminal; see
-  [Cross-environment resume](cross-environment-resume.md).
+  up the most recent conversation run from this project's own directory, including one you started in a terminal
+  there. It never picks up a conversation from a parent or child folder: if this folder has none, Untether says so
+  and starts nothing. See [Cross-environment resume](cross-environment-resume.md).
 
-agy sends one answer per run. If it started a background command, it holds the answer until that finishes (up to 30
-minutes) and the progress message shows `⏳ Antigravity is waiting for 1 background task …`. That isn't a stall.
+agy sends one answer per run. If it started a background command or a timer, it holds the answer until that
+finishes (up to 30 minutes) and the progress message shows `⏳ Antigravity is waiting for 1 background task …`.
+That isn't a stall.
+
+**Background work.** Commands still running in the background, timers and subagents are listed in a
+`⏳ background (N)` block in the progress message, one row each with its elapsed time, and `/ping` counts them.
+In practice the rows appear in Full access, because Workspace has no shell, timer or subagent tool. A command that
+agy starts as a daemon (a dev server, say) can keep running after the answer; Untether doesn't reliably stop it, so
+check for it and stop it yourself when you're done. Details:
+[Background tasks and subagents](../reference/runners/antigravity/runner.md#background-tasks-and-subagents-in-the-status-panel).
+
+**After `/cancel`.** The output of a turn you cancelled can appear at the start of agy's next reply in the same
+conversation. That is how agy behaves (seen on agy 1.3.3), not something Untether adds; send `/new` if you want a
+clean start.
 
 <!-- TODO: capture screenshot: antigravity-workspace-final — final message of a Workspace run with the model · effort · workspace footer and the agy resume line -->
 <!-- <img src="../assets/screenshots/antigravity-workspace-final.jpg" alt="Antigravity final message with footer and agy --conversation resume line" width="360" loading="lazy" /> -->
@@ -183,16 +196,29 @@ If a saved level isn't one the model accepts, the run drops it and shows
 `⚠️ Effort <level> isn't available for <model>, so agy used its default`. See
 [Antigravity effort](model-reasoning.md#antigravity-effort).
 
+**Context use.** With a model set for the chat, the first line of a progress message and answer can end with
+`~3% ctx`: the tokens the model last read, as a share of the context window Google publishes for that model. It
+is an estimate. agy doesn't report a window, and it compacts a conversation on its own schedule without saying so,
+so a low figure doesn't mean compaction is far off. With no model set (agy's default), or a model Untether has no
+published figure for, no percentage is shown. Details:
+[Context use](../reference/runners/antigravity/runner.md#context-use-n-ctx).
+
 <!-- TODO: capture screenshot: antigravity-effort-limited — /config → Effort page for a model with limited levels (a Gemini Pro id showing Low and High only) -->
 <!-- <img src="../assets/screenshots/antigravity-effort-limited.jpg" alt="Effort page for an Antigravity model that offers Low and High only" width="360" loading="lazy" /> -->
 
 ## Usage and quota
 
 Send `/usage` in an Antigravity chat to see agy's quota groups (for example a 5-hour and a weekly limit per model
-group, each with a bar, the percentage used and the reset time), then the last session's token totals. Checking
-costs no tokens.
+group, each with a bar, the percentage used and the reset time), your remaining AI credits, then the last
+session's token totals. Checking costs no tokens.
 
-- Footers show tokens for the run; there is no dollar cost and no quota footer.
+- Footers show tokens for the run; there is no dollar cost.
+- A quota line can follow an answer. Turn it on in `/config` → **Cost & usage** → **Subscription usage** to see
+  `⚡ Gemini Models 5h: 12% | wk: 3%` after each run; with it off, a line appears only once a limit reaches 70 %.
+  The line is taken from your last `/usage`, for up to 15 minutes, so it never slows an answer down. Send `/usage`
+  again for current numbers.
+- `/stats auth` shows which sign-in route agy is set to use, for up to an hour after an Antigravity run (nothing
+  straight after a restart). It doesn't start agy or test the sign-in.
 - `[cost_budget]` limits count dollars, so they never trip for Antigravity.
 - When a quota is used up, the run ends with `This Antigravity quota is used up. /usage shows when each group
   resets`, and Untether doesn't retry.
@@ -204,12 +230,19 @@ Sample output: [Cost budgets → Antigravity](cost-budgets.md#antigravity).
 
 ## Scheduled runs
 
-Cron and webhook runs work with Antigravity, with two rules that differ from chat:
+Cron and webhook runs work with Antigravity, with three rules that differ from chat:
 
 - **They never inherit Full access.** A cron gets it only from its own `permission_mode = "full"`. A webhook run
   never does. Otherwise the run is Workspace, whatever the chat or `untether.toml` says.
 - **They are held when the project's agy config changed** since someone last ran Antigravity in that chat (next
-  section). Send any message in the chat to review it; the schedule runs again after that.
+  section). The next message someone sends in the chat runs with the changed config and shows what changed in
+  a ⚠️ row; the schedule runs again after that. An `/at` or `/loop` run doesn't release it. Check the files the
+  message lists first if you didn't change them.
+- **A Workspace run is held while agy's own tool-permission setting can't be read.** Untether checks it with
+  `agy -p /config` before the run; if that fails or returns no value, the scheduled run replies `Untether couldn't
+  read agy's tool-permission setting before this run …` and nothing starts. Nothing needs changing: the next fire
+  checks again. A run you start from the chat goes ahead with a ⚠️ row instead, as long as agy reports the setting
+  when it starts.
 
 ```toml
 [[triggers.crons]]
@@ -233,8 +266,10 @@ Workspace included, and without a tool call. Untether can't stop them, so it tel
   that Untether doesn't manage. Review them if you didn't add them.
 - **A run changed that config** (or files other engines act on, such as `.claude/`, `.mcp.json` or
   `.github/workflows/`): a ⚠️ row after the run asks you to review it before sending another message.
-- **Scheduled runs** are refused while the config differs from what an attended run last showed, or while Untether
-  can't finish the check.
+- **Scheduled runs** are held while the config differs from what a run someone started from the chat last showed,
+  or while Untether can't finish the check. A changed config is released by the next message a person sends in
+  the chat; a check that can't finish (too many files, or a config file Untether can't read with certainty) holds
+  them until it succeeds.
 
 This is a tripwire with known limits, not isolation. The limits are listed in the
 [runner reference](../reference/runners/antigravity/runner.md#agy-hooks-plugins-and-mcp-servers).
@@ -245,7 +280,10 @@ This is a tripwire with known limits, not isolation. The limits are listed in th
   release). `/planmode` is a Claude command.
 - `/steer` and live sessions: each message is its own agy run.
 - Images as image input: a Telegram photo reaches agy as a saved file path.
-- Subagent detail: a subagent shows as one row.
+- Subagent detail: each subagent gets a row in the `⏳ background` block, but its own steps, output and token use
+  aren't shown, and a subagent that failed looks the same as one that finished.
+- `/export` after a restart: the export comes from Untether's own memory of the session, so it is empty once
+  Untether restarts and never includes turns run in a terminal.
 
 The full comparison with other engines is in the
 [engine compatibility matrix](../reference/runners/index.md).
@@ -257,6 +295,7 @@ The full comparison with other engines is in the
 - [Antigravity was blocked from using a shell command or a file outside the project](troubleshooting.md#antigravity-was-blocked-from-using-a-shell-command-or-a-file-outside-the-project)
 - [Antigravity seems stuck after answering](troubleshooting.md#antigravity-seems-stuck-after-answering)
 - [A scheduled Antigravity run was refused because its workspace config changed](troubleshooting.md#a-scheduled-antigravity-run-was-refused-because-its-workspace-config-changed)
+- [A scheduled Antigravity run says it couldn't read agy's tool-permission setting](troubleshooting.md#a-scheduled-antigravity-run-says-it-couldnt-read-agys-tool-permission-setting)
 - ["Antigravity needs a project"](troubleshooting.md#antigravity-needs-a-project)
 
 Everything else is under [Troubleshooting → Antigravity CLI](troubleshooting.md#antigravity-cli), and each message

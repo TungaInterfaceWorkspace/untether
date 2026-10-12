@@ -1,8 +1,8 @@
 # Antigravity CLI stream-json cheatsheet
 
 `agy --output-format stream-json` writes one JSON object per line to stdout. Every line has an `event` field:
-`init`, `step_update`, `result` or `command_result`. The examples below are real lines from agy 1.3.1 and 1.3.2,
-with paths shortened and the tool list cut.
+`init`, `step_update`, `result` or `command_result`. The examples below are real lines from agy 1.3.1, 1.3.2
+and 1.3.3, with paths and ids shortened and the tool list cut.
 
 !!! note "Things that differ from what you might expect"
     - There is **no `error` event**. Failures arrive as a `result` with `status: "ERROR"`, or as a non-zero exit
@@ -29,7 +29,8 @@ Untether starts agy with `--input-format stream-json` and writes one line to std
 - `conversation_id` is the resume id (a UUID).
 - `init.permission_mode` is the policy agy is running under: `request-review` (default), `strict`,
   `proceed-in-sandbox` or `always-proceed` (what `--dangerously-skip-permissions` reports).
-- `init.model` is present from agy 1.3.2.
+- `init.model` is present from agy 1.3.2, **only when `--model` was passed**: it echoes the flag (for example
+  `gemini-3.8-flash-low`). With no `--model`, no line of the stream names the model.
 - `init.tools` is a long list of tool names; don't rely on its contents.
 - `init.json_schema` echoes a `--json-schema` argument (Untether doesn't pass one).
 
@@ -93,6 +94,30 @@ A tool refused by a **hook** is different: its step ends `ERROR` with `tool_info
 The `DONE` line adds each subagent's own `conversation_id` and a `log_uri`. The subagent's steps are not in the
 parent stream.
 
+That is agy 1.3.1. On 1.3.3 the spawn is a `tool` step while `ACTIVE` and becomes a `subagent` step only at
+`DONE`, about 0.3 s later, while the subagents are still working:
+
+```json
+{"event":"step_update","step_update":{"conversation_id":"0000…","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"invoke_subagent","tool_info":{"name":"invoke_subagent","parameters":{"Subagents":[{"Model":"inherit","Prompt":"Read notes.txt …","Role":"Alpha","TypeName":"research","Workspace":"inherit"},{"Model":"inherit","Prompt":"Read hello.py …","Role":"Beta","TypeName":"research","Workspace":"inherit"}]}}}}
+{"event":"step_update","step_update":{"conversation_id":"0000…","step_index":2,"state":"DONE","step_type":"subagent","tool_name":"invoke_subagent","duration_seconds":0.27,"subagent_info":{"subagents":[{"type_name":"research","role":"Alpha","initial_prompt":"…","conversation_id":"…","log_uri":"file://…/transcript.jsonl","workspace_uris":["file:///work/proj"]},{"type_name":"research","role":"Beta","initial_prompt":"…","conversation_id":"…"}]}}}
+```
+
+Each subagent finishing is one `system_message` step in the parent stream, with nothing to say which one:
+
+```json
+{"event":"step_update","step_update":{"conversation_id":"0000…","step_index":4,"state":"DONE","step_type":"system_message","duration_seconds":0.0004}}
+```
+
+### Background commands, timers and daemons
+
+- A background `run_command` stays `ACTIVE` until the command ends, and agy prints nothing else meanwhile (it
+  holds the model's reply). Its `parameters` carry only `CommandLine`; `WaitMsBeforeAsync` and `IsDaemon` are
+  not in the stream.
+- A `schedule` step (`parameters`: `DurationSeconds`, `Prompt`) stays `ACTIVE` for the timer's whole life.
+- When either finishes, its `DONE` line is followed by the held reply and a `system_message` step.
+- A daemon `run_command` never reaches `DONE`: the next `agent_response` and the `result` arrive while it is still
+  `ACTIVE`, and the process is still running after agy exits (1.3.3).
+
 ### `finish`
 
 With a JSON schema, the `finish` tool goes `ACTIVE` as `step_type: "tool"` and `DONE` as `step_type: "finish"`.
@@ -125,6 +150,17 @@ Signed out (no `init`, exit 1):
 ```json
 {"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}
 ```
+
+`result.usage` is a **running sum**, not a context size: it adds every model call of the turn and, on a resumed
+conversation, the earlier turns too (a five-call turn of 7,902 to 9,501 input tokens reports 42,593). Each model
+call's own figures are on its `agent_response` step:
+
+```json
+{"event":"step_update","step_update":{"conversation_id":"90ca…","step_index":9,"state":"DONE","step_type":"agent_response","text_delta":"\n","duration_seconds":2.3,"usage":{"input_tokens":9501,"output_tokens":221,"thinking_tokens":81,"cache_read_tokens":0,"total_tokens":9722}}}
+```
+
+`cache_read_tokens` is reported apart from `input_tokens` (`total_tokens` is input + output). No field anywhere
+in the stream names a context window, a limit or a maximum.
 
 Other fields: `structured_output` and `json_schema` (with `--json-schema`). `error` is usually a string, but
 Untether accepts any JSON value there so a structured error never loses the result. Statuses other than `SUCCESS`

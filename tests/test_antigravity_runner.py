@@ -188,10 +188,14 @@ def test_build_args_resume_uses_conversation() -> None:
 
 
 def test_build_args_continue_checked_before_value() -> None:
-    args = _args(ResumeToken(engine=ENGINE, value="", is_continue=True))
-    assert "--continue" in args
-    assert not any(a.startswith("--conversation") for a in args)
-    assert "" not in args
+    # #817: a /continue token has value "" and must never become
+    # `--conversation=`. #1039: nor agy's own continue flag, which crosses
+    # into parent and child directories — `run_impl` resolves the id first
+    # (tests/test_antigravity_continue.py).
+    from untether.utils.antigravity_argv import AgyArgvError
+
+    with pytest.raises(AgyArgvError):
+        _args(ResumeToken(engine=ENGINE, value="", is_continue=True))
 
 
 def test_build_args_model_from_run_options_overrides_config() -> None:
@@ -1256,6 +1260,7 @@ def test_background_row_retitled_after_five_seconds(
         _feed(runner, state, lines[:4])
         assert _feed(runner, state, [other]) == []  # younger than 5 s: untouched
         state.bg_steps[2] = time.monotonic() - 6.0
+        state.tasks["cmd:2"].background_from -= 6.0  # #978: one shared deadline
         (updated,) = _feed(runner, state, [other])
         assert isinstance(updated, ActionEvent) and updated.phase == "updated"
         assert updated.action.id == "step-2"

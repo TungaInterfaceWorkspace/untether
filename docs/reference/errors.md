@@ -68,6 +68,7 @@ Every Antigravity model or effort rejection starts with `invalid model selection
 
 | Pattern | Hint | Engines |
 |---------|------|---------|
+| `requires --effort` | That model needs an effort level — agy offers low, medium, high. Set one with `/reasoning set <level>` or in /config → Effort, then send your message again. The levels are the ones agy's refusal names, shown only when they are all levels Untether knows ([#1046](https://github.com/littlebearapps/untether/issues/1046)). | Antigravity |
 | `" effort (available:` / `invalid --effort` / `conflicts with --effort` | That effort level isn't available for this Antigravity model — pick another in /config → Effort, or use a model id without an effort suffix. | Antigravity |
 | `invalid model selection` | Antigravity doesn't recognise that model. Run `agy models` on the host for the list, or `/model clear`. | Antigravity |
 | `model_not_found` | Model not available. Check the model name in `/config`. | All |
@@ -177,13 +178,19 @@ Antigravity CLI (`agy`) errors are Untether's own messages, written when the run
 | `Antigravity was interrupted` | The run was cancelled or the process was signalled | Reply to the resume line to continue |
 | `🛑 That model id isn't valid for Antigravity, so nothing was started.` | The chat's, cron's or config's model id has a space, a leading dash or another character Antigravity model ids don't use | `/model set <id>` with a valid id (`agy models` lists them), or `/model clear` |
 | `🛑 That Antigravity conversation id isn't valid, so nothing was started.` | The resume line or saved session holds something that isn't a conversation id | `/new`, then send the message again |
-| `Antigravity needs a project` | The chat has no project directory | `/ctx set <project>`, or add a `[projects.*]` entry |
+| `The conversation Antigravity had recorded for this project no longer exists, so nothing was resumed.` | `/continue` found this project's last conversation in agy's record, but agy no longer has it. The chat's saved session is untouched | Send a normal message to carry on from the chat's own conversation or start a new one, or reply to a resume line |
+| `No Antigravity conversation for this project yet` | `/continue` found no conversation run from this project's own directory. Conversations in a parent or child folder don't count | Send a normal message to start one, or reply to a resume line |
+| `Antigravity's most recent conversation in this folder has also been run from another folder` | `/continue` can't tell which project that conversation belongs to, so it wasn't resumed | Send a normal message, or reply to the resume line of the conversation you want |
+| `Untether couldn't read Antigravity's record of recent conversations` | agy's last-conversations file is unreadable or not in the expected form, so `/continue` resumed nothing | Send a normal message, or reply to a resume line. `antigravity.continue.refused` in the logs gives the reason |
+| `Antigravity needs a project` | The chat has no project directory, or its path can't be resolved | `/ctx set <project>`, or add a `[projects.*]` entry |
 | `🛑 Antigravity CLI <version> is older than 1.3.1` | agy is too old | `agy update` on the host |
 | `⚠️ Antigravity was blocked from using a …` | agy refused a tool in Workspace: usually a file outside the project; a shell command only in a conversation that isn't on Untether's no-shell agent | `/config` → Permission mode → Full access, then `/new` (agy keeps a conversation on the tools it started with). See [Troubleshooting](../how-to/troubleshooting.md#antigravity-cli) |
 | `Ask me needs Untether's approval gate` / `Plan first needs …` | That mode isn't available yet | Pick Workspace or Full access in `/config` |
 | `agy's own settings change its permission checks` | agy's `toolPermission` setting would approve tools by itself | Set it back to `request-review`, or pick Full access |
-| `agy's workspace config changed since someone last ran Antigravity` | A scheduled run was held because the project's agy hooks, plugins or MCP config changed | Send any message in the chat, review the ⚠️ row; the schedule then runs again |
-| `Untether couldn't check agy's hooks, plugins and MCP servers` | A scheduled run was held because the check couldn't finish | Send a message in the chat to see why, or trim the project's `.agents/` folder |
+| `Untether couldn't confirm agy's tool-permission setting` | Neither the check before the run nor agy's first event gave agy's `toolPermission`, so a Workspace run was stopped | Try again in a few minutes. If it keeps happening, check `agy -p /config` works on the host and update Untether; or pick Full access |
+| `Untether couldn't read agy's tool-permission setting before this run` | A scheduled Workspace run was held because the `agy -p /config` check failed or returned no `toolPermission` | Nothing to change: the next fire checks again. If it persists, run `agy -p /config` on the host |
+| `agy's workspace config changed since someone last ran Antigravity` | A scheduled run was held because the project's agy hooks, plugins or MCP config changed | Check the listed files on the host if you didn't change them. The next message sent in the chat runs with the changed config and shows a ⚠️ row; the schedule then runs again. An `/at` or `/loop` run doesn't release it |
+| `Untether couldn't check agy's hooks, plugins and MCP servers` | Scheduled runs are held because the check couldn't finish | Trim the project's `.agents/` folder so the check can finish. A message sent in the chat still runs and shows why in a ⚠️ row, but doesn't release the hold |
 | `agy reported a model/agent error` | agy exited with a turn-level failure | Retry; check `/usage` |
 | `antigravity ended with status <status>` | agy finished with a status other than success or error | Retry, or split the task |
 | `antigravity failed (<exit>)` | agy exited without a result | Read the excerpt underneath; URLs, tokens and paths in it are redacted |
