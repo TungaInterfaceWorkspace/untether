@@ -46,12 +46,15 @@ to retry. A symlinked config is followed when the link is re-pointed; if the new
 target lives in a different directory, restart Untether so later in-place edits
 of that file are seen.
 
-Editing a field marked 🔄 (**restart-required**) posts a warning to the project
-chats and admin DMs ("⟳ Setting `chat_id` changed — restart required to take
-effect.", followed by a "To apply:" line naming the service that's actually
-running, [#927](https://github.com/littlebearapps/untether/issues/927)) and logs
-`config.reload.transport_config_changed`. Other Telegram
-transport changes apply without a message and log
+Editing a field marked 🔄 (**restart-required**) posts one `⚠️ Restart required`
+notice to the project chats and admin DMs. It lists the keys and names the
+service that's actually running in its "To apply" line
+([#927](https://github.com/littlebearapps/untether/issues/927)), and the reload logs
+`config.reload.transport_config_changed`. Other Telegram transport changes are
+confirmed with a silent `♻️ Hot-reloaded … No restart needed` notice, sent only to
+the `allowed_user_ids` admin DMs (the main `chat_id` when there are none) and to
+chats with a run in progress
+([#1030](https://github.com/littlebearapps/untether/issues/1030)), and log
 `config.reload.transport_config_hot_reloaded`.
 
 Separately from the watcher, the per-run settings (`[footer]`, `[progress]`,
@@ -430,7 +433,7 @@ Budget alerts always appear regardless of `[footer]` settings.
 | `bg_hold_rearm_on_progress` | bool | `true` | ([#829](https://github.com/littlebearapps/untether/issues/829)) Claude live sessions only. Re-arm the background hold on background activity (see above). `false` restores the rc14 behaviour: the hold counts from the last turn, so a quietly working agent is stopped when it expires. Read per spawn, so a change applies from the next run (`/new`). |
 | `bg_hold_declared_waits` | bool | `true` | ([#872](https://github.com/littlebearapps/untether/issues/872)) Claude live sessions only. The background hold never closes a session before a wait Claude declared has ended: a background command's `timeout` (passed with `run_in_background`; Claude Code stops the command at that limit, at most 2 h) or a pending scheduled wake-up (at most 1 h), plus a 60 s grace. When that wait ends, the quiet-time limit starts afresh so the turn reporting back (and its hooks) can finish. `live_session_max_s` still caps it. `false` restores the quiet-time rule only. Read per spawn (`/new`). |
 | `live_sessions` | bool | `true` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Claude only. Keep the session open after its answer while background work runs: background-task, Monitor and scheduled-wake-up turns are delivered as their own Telegram messages, and follow-ups are written into the open session instead of resuming it. With live sessions on, `post_result_limbo_grace` is the idle close (stdin closed gracefully, nothing quarantined) and `post_result_bg_max_hold` is how long background work may run with no activity. `false` restores the pre-0.36.0 "stop at the first answer" behaviour. |
-| `live_session_max_s` | float | `14400.0` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Absolute lifetime of one live Claude process from spawn (600–86400; 4 h by default). The session is closed with a notice when reached, as a backstop against an endless `Monitor`. The clock isn't reset by follow-ups or background-task turns, and there's no warning before it. A session that was idle closes cleanly and resumes; if a turn or background tasks were still running they're stopped and the next message starts a fresh session ([#887](https://github.com/littlebearapps/untether/issues/887)). Raise it (e.g. `43200`, 12 h) for long background-agent workflows. Read per spawn: no restart needed, and an open session keeps its limit. See [Troubleshooting](../how-to/troubleshooting.md#session-closed-after-4-hours-and-the-next-message-started-fresh). |
+| `live_session_max_s` | float | `14400.0` | ([#776](https://github.com/littlebearapps/untether/issues/776)) Absolute lifetime of one live Claude process from spawn (600–86400; 4 h by default). The session is closed with a notice when reached, as a backstop against an endless `Monitor`. The clock isn't reset by follow-ups or background-task turns, and there's no warning before it. A reply in progress at the limit is allowed to finish (up to 30 more minutes) and the session closes straight after it; background tasks still running then are stopped. The next message continues the same session unless Claude Code failed to shut down cleanly, in which case a notice says it starts fresh ([#887](https://github.com/littlebearapps/untether/issues/887)). Raise it (e.g. `43200`, 12 h) for long background-agent workflows. Read per spawn: no restart needed, and an open session keeps its limit. See [Troubleshooting](../how-to/troubleshooting.md#session-closed-after-4-hours-and-the-next-message-started-fresh). |
 | `rearm_plan_mode` | bool | `true` | ([#383](https://github.com/littlebearapps/untether/issues/383)) Claude only, live sessions only. In a `plan` / `plan-auto` chat, approving a plan takes the open Claude session out of plan mode; with this on, Untether puts it back (the CLI's own `set_permission_mode`) when the reply ends, so your next message — and, in `plan` chats, a background wake-up — is planned again. `plan-auto` re-plans your messages only, not wake-ups. Background agents the approved reply launched finish first: the switch-back waits until they end or show no activity for `post_result_bg_max_hold` (capped at `live_session_max_s`), and replies meanwhile say `⚠️ Not re-planned`. Read at each new session. `false` = never sent (an approval then lasts the whole session). |
 | `hold_for_async_hooks` | bool | `true` | ([#812](https://github.com/littlebearapps/untether/issues/812)) Claude live sessions only. Keep the session's stdin open while a hook the CLI runs in the background (`async` / `asyncRewake`) is still running, so an `asyncRewake` hook's findings arrive as their own `🪝 Hook feedback` turn instead of being dropped when stdin closes. Passes `--include-hook-events` when the installed CLI supports it. Read per spawn. `false` = no flag and no hold. |
 | `async_hook_max_hold` | float | `630.0` | ([#812](https://github.com/littlebearapps/untether/issues/812)) Upper bound, in seconds, on that hold per hook, counted from the hook's start (0–3600). The default is the CLI's 600 s `asyncRewake` timeout plus its 30 s exit wait. |
@@ -784,7 +787,7 @@ routing details.
 |-----|------|---------|-------|
 | `host` | string | `"127.0.0.1"` | Bind address. Use a reverse proxy for internet exposure. |
 | `port` | int | `9876` | Listen port (1–65535). |
-| `rate_limit` | int (≥ 1) | `60` | Max requests per minute (global + per-webhook). |
+| `rate_limit` | int (≥ 1) | `60` | Max requests per minute (global + per-webhook). Also the failed-auth budget per webhook and client address per minute; a loopback peer (a reverse proxy on the same host) is never locked out by it — see [Triggers reference — Security](triggers/triggers.md#security) ([#906](https://github.com/littlebearapps/untether/issues/906)). |
 | `max_body_bytes` | int | `1048576` | Max request body size in bytes (1024–10485760). |
 
 ### `[[triggers.webhooks]]`
@@ -797,7 +800,7 @@ routing details.
 | `engine` | string\|null | `null` | Engine override. If unset: the `project`'s `default_engine` when a project is set, otherwise the global `default_engine` ([#862](https://github.com/littlebearapps/untether/issues/862)). |
 | `chat_id` | int\|null | `null` | Telegram chat. Falls back to the transport default `chat_id`, even when `project` is set (the project's bound chat is not used; a warning is logged when they differ). |
 | `auth` | string | `"bearer"` | `"bearer"`, `"hmac-sha256"`, `"hmac-sha1"`, or `"none"`. |
-| `secret` | string\|null | `null` | Auth secret. Required when `auth` is not `"none"`. |
+| `secret` | string\|null | `null` | Auth secret. Required when `auth` is not `"none"`. No minimum length is enforced — use a long random value. |
 | `action` | `"agent_run"`\|`"file_write"`\|`"http_forward"`\|`"notify_only"` | `"agent_run"` | What the webhook does. Non-agent actions use `file_path` + `on_conflict`, `forward_url` + `forward_headers` + `forward_method`, or `message_template`, plus `notify_on_success` / `notify_on_failure` — see the [Triggers reference](triggers/triggers.md). |
 | `prompt_template` | string\|null | `null` | Prompt with `{{field.path}}` substitutions. Required when `action = "agent_run"`. |
 | `event_filter` | string\|null | `null` | Only process matching event type headers. |

@@ -1394,6 +1394,38 @@ async def test_on_resume_failed_called_for_zero_turn_error() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("num_turns", "hinted"), [(50, False), (0, True)])
+async def test_887_archive_hint_not_shown_for_a_run_that_had_turns(
+    num_turns: int, hinted: bool
+) -> None:
+    """#887: ``error_during_execution`` after 50 turns is not a session that
+    "could not be loaded" — the user must not be told to send /new."""
+    transport = FakeTransport()
+    runner = ScriptRunner(
+        [
+            ErrorReturn(
+                error="Claude Code run failed (error_during_execution)",
+                usage={"num_turns": num_turns},
+            )
+        ],
+        engine=CODEX_ENGINE,
+        resume_value="long-session",
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport, presenter=MarkdownPresenter(), final_notify=True
+    )
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+        resume_token=ResumeToken(engine=CODEX_ENGINE, value="long-session"),
+    )
+    texts = [c["message"].text for c in transport.send_calls + transport.edit_calls]
+    assert any("error_during_execution" in t for t in texts)
+    assert any("could not be loaded" in t for t in texts) is hinted
+
+
+@pytest.mark.anyio
 async def test_on_resume_failed_not_called_on_success() -> None:
     """Callback does not fire when the run succeeds."""
     transport = FakeTransport()
@@ -2968,6 +3000,94 @@ async def test_stall_auto_cancel_no_pid_no_events() -> None:
     ]
     assert len(auto_cancel_msgs) == 1
     assert "no_pid_no_events" in auto_cancel_msgs[0]["message"].text
+
+
+@pytest.mark.anyio
+async def test_994_no_pid_no_events_auto_cancel_survives_render_bumps() -> None:
+    """#994: Untether's own re-renders (stall-path heartbeats, the #954 header
+    tick) bump ``event_seq`` but are not engine events — a run with no PID
+    that never produced one is still auto-cancelled."""
+    transport = FakeTransport()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._heartbeat_interval = 0.01  # the header tick fires on every tick
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._stall_repeat_seconds = 0.01
+    edits._STALL_MAX_WARNINGS_NO_PID = 2
+    edits.pid = None
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            for i in range(8):
+                clock.set(100.1 + i * 0.1)
+                await anyio.sleep(0.03)
+                if i == 0:
+                    # The first stall warning is out; a stall-path heartbeat
+                    # then repaints the progress message.
+                    assert edits._stall_warn_count >= 1
+                    assert not cancel_event.is_set()
+                    edits._bump_heartbeat()
+                if cancel_event.is_set():
+                    break
+            if not cancel_event.is_set():
+                edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert edits.event_seq > 0  # it did repaint
+    assert edits.engine_event_count == 0
+    assert cancel_event.is_set()
+    auto_cancel_msgs = [
+        c for c in transport.send_calls if "Auto-cancelled" in c["message"].text
+    ]
+    assert len(auto_cancel_msgs) == 1
+    assert "no_pid_no_events" in auto_cancel_msgs[0]["message"].text
+
+
+@pytest.mark.anyio
+async def test_994_engine_event_blocks_no_pid_no_events_auto_cancel() -> None:
+    """#994: one real engine event means the run did start — the aggressive
+    ``no_pid_no_events`` arm stands down (the absolute cap still applies)."""
+    from untether.model import Action, ActionEvent
+
+    transport = FakeTransport()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._stall_repeat_seconds = 0.01
+    edits._STALL_MAX_WARNINGS_NO_PID = 2
+    edits.pid = None
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+    await edits.on_event(
+        ActionEvent(
+            engine="codex",
+            action=Action(id="a1", kind="note", title="thinking"),
+            phase="completed",
+            ok=True,
+        )
+    )
+    assert edits.engine_event_count == 1
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            for i in range(6):
+                clock.set(100.1 + i * 0.1)
+                await anyio.sleep(0.03)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert edits._stall_warn_count >= 2
+    assert not cancel_event.is_set()
 
 
 @pytest.mark.anyio
@@ -7487,11 +7607,14 @@ def test_954_heartbeat_ticks_header_during_silent_generation() -> None:
     clock = _FakeClock(start=100.0)
     edits = _make_edits(FakeTransport(), _KeyboardPresenter(), clock=clock)
     edits._heartbeat_interval = 30.0
-    edits._heartbeat_tick()  # never rendered, but no engine event yet either
-    # event_seq stays 0 — the no_pid_no_events auto-cancel's signal.
-    assert edits.event_seq == 0
-    edits.event_seq = before = 1  # the engine's first event...
-    edits._last_render_at = 95.0  # ...rendered 5 s ago
+    # #1017: no engine event yet — the header ticks all the same. That is a
+    # repaint, not an engine event (#994: ``no_pid_no_events`` keys on
+    # ``engine_event_count``).
+    edits._heartbeat_tick()
+    assert edits.event_seq == 1
+    assert edits.engine_event_count == 0
+    before = edits.event_seq
+    edits._last_render_at = 95.0  # rendered 5 s ago
     edits._heartbeat_tick()
     assert edits.event_seq == before  # rendered recently — nothing to refresh
     clock.set(125.0)
@@ -7537,6 +7660,36 @@ async def test_954_silent_run_header_elapsed_advances() -> None:
         tg.cancel_scope.cancel()
     texts = [c["message"].text for c in transport.edit_calls]
     assert texts == ["working 5s", "working 65s"]
+
+
+@pytest.mark.anyio
+async def test_1017_silent_followup_turn_header_elapsed_advances() -> None:
+    """#1017: a live follow-up turn's own ``ProgressEdits`` (fresh, so no
+    engine event yet; the turn is open) repaints its elapsed time from the
+    heartbeat instead of sitting at ``0s`` until the answer arrives."""
+    transport = FakeTransport()
+    clock = _FakeClock(start=0.0)
+    edits = _make_edits(transport, _KeyboardPresenter(), clock=clock, engine="claude")
+    edits._heartbeat_interval = 30.0
+    edits.pid = 4242
+    edits.stream = _make_stream(
+        last_event_type="user",
+        engine_state=_make_engine_state(
+            live_mode=True, completed_turns=1, turn_open=True
+        ),
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(edits._run_loop, tg)
+        clock.set(30.0)
+        edits._heartbeat_tick()
+        await anyio.sleep(0.02)
+        clock.set(60.0)
+        edits._heartbeat_tick()
+        await anyio.sleep(0.02)
+        tg.cancel_scope.cancel()
+    texts = [c["message"].text for c in transport.edit_calls]
+    assert texts == ["working 30s", "working 60s"]
+    assert edits.engine_event_count == 0
 
 
 @pytest.mark.anyio
@@ -8076,6 +8229,82 @@ async def test_928_early_delivery_timeout_after_send_does_not_redeliver(
     assert len(_final_sends()) == 1, "final delivered twice"
     completed = [r for r in logs if r.get("event") == "runner.completed"]
     assert len(completed) == 1, completed
+
+
+@pytest.mark.anyio
+async def test_991_delivery_timeout_mid_split_final_sends_every_chunk_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#991: the early-delivery bound fires while chunk 2 of a split final is
+    still being sent. Through the real Telegram transport and outbox, every
+    chunk still goes out — in order, each exactly once — and the session
+    close does not send the final again."""
+    import re
+
+    import untether.runner_bridge as rb
+    from tests.telegram_fakes import FakeBot
+    from untether.telegram.bridge import TelegramPresenter, TelegramTransport
+    from untether.telegram.client import TelegramClient
+
+    monkeypatch.setattr(rb, "_EARLY_DELIVERY_TIMEOUT_S", 0.2)
+    answer = "\n\n".join(f"Paragraph {i}. " + "word " * 120 for i in range(20))
+    bot = FakeBot()
+    chunks: list[str] = []
+    release = anyio.Event()
+    original_send = bot.send_message
+
+    async def stalling_send(chat_id: int, text: str, *args: Any, **kwargs: Any):
+        if "Paragraph" in text:
+            chunks.append(text)
+            if len(chunks) == 2:
+                await release.wait()  # chunk 2 is stuck in a network retry
+        return await original_send(chat_id, text, *args, **kwargs)
+
+    bot.send_message = stalling_send  # type: ignore[method-assign]
+    client = TelegramClient(client=bot, private_chat_rps=0.0, group_chat_rps=0.0)
+    await client.send_message(chat_id=123, text="warm-up")  # starts the outbox
+    hang = anyio.Event()
+    runner = ScriptRunner(
+        [Emit(_completed_591(answer)), Wait(hang), Return(answer=answer)],
+        engine=CODEX_ENGINE,
+    )
+    cfg = ExecBridgeConfig(
+        transport=TelegramTransport(client),
+        presenter=TelegramPresenter(),
+        final_notify=True,
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def _run() -> None:
+                await handle_message(
+                    cfg,
+                    runner=runner,
+                    incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+                    resume_token=None,
+                )
+
+            tg.start_soon(_run)
+            with anyio.fail_after(5.0):
+                while not any(
+                    r.get("event") == "final.early_delivery_timeout" for r in logs
+                ):
+                    await anyio.sleep(0.01)
+            assert len(chunks) == 2, "the bound fired between chunk 1 and chunk 2"
+            release.set()
+            hang.set()  # session closes: the run generator returns
+
+        with anyio.fail_after(5.0):
+            while "Paragraph 19." not in "".join(chunks):
+                await anyio.sleep(0.01)
+        await anyio.sleep(0.05)  # nothing further (no duplicate) goes out
+
+    assert len(chunks) >= 3
+    paragraphs = [int(n) for n in re.findall(r"Paragraph (\d+)\.", "".join(chunks))]
+    assert paragraphs == list(range(20))
+    assert any(r.get("event") == "transport.followups.queued_on_cancel" for r in logs)
+    assert len([r for r in logs if r.get("event") == "runner.completed"]) == 1
 
 
 def test_591_note_final_records_without_repaint() -> None:
@@ -9223,6 +9452,174 @@ async def test_cancel_mid_delivery_lets_final_delivery_finish() -> None:
         "on_completed was cancelled mid-delivery; final answer delivery "
         "must be shielded so the sent-flag matches what reached the wire"
     )
+
+
+# ── #991: the steps after the early final have their own scope ─────────────
+
+
+async def _run_991(on_completed, on_delivered, *, running_task=None) -> RunOutcome:
+    from untether.runner_bridge import run_runner_with_cancel
+
+    runner = ScriptRunner([Emit(_completed_591())], engine=CODEX_ENGINE)
+    return await run_runner_with_cancel(
+        runner,
+        prompt="p",
+        resume_token=None,
+        edits=_make_edits(FakeTransport(), _KeyboardPresenter()),
+        running_task=running_task,
+        on_thread_known=None,
+        channel_id=123,
+        on_completed=on_completed,
+        on_delivered=on_delivered,
+    )
+
+
+@pytest.mark.anyio
+async def test_991_delivery_timeout_still_runs_post_delivery_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#991: a delivery that outlives the early-delivery bound is cut short,
+    and the steps queued behind it used to be cut with it. They run in their
+    own scope now: once, after the bound fired."""
+    import untether.runner_bridge as rb
+
+    monkeypatch.setattr(rb, "_EARLY_DELIVERY_TIMEOUT_S", 0.1)
+    calls: list[str] = []
+
+    async def deliver(evt, outcome) -> None:
+        calls.append("deliver")
+        await anyio.sleep_forever()
+
+    async def after(evt, outcome) -> None:
+        calls.append("after")
+
+    with structlog.testing.capture_logs() as logs, anyio.fail_after(5):
+        outcome = await _run_991(deliver, after)
+
+    assert calls == ["deliver", "after"]
+    assert outcome.completed is not None and not outcome.cancelled
+    events = [r["event"] for r in logs]
+    assert events.count("final.early_delivery_timeout") == 1
+    assert "final.post_delivery_timeout" not in events
+
+
+@pytest.mark.anyio
+async def test_991_post_delivery_runs_once_after_a_normal_delivery() -> None:
+    """The path without a timeout is unchanged: delivery, then the steps
+    after it, once each, and nothing is logged."""
+    calls: list[str] = []
+
+    async def deliver(evt, outcome) -> None:
+        calls.append("deliver")
+
+    async def after(evt, outcome) -> None:
+        calls.append("after")
+
+    with structlog.testing.capture_logs() as logs, anyio.fail_after(5):
+        await _run_991(deliver, after)
+
+    assert calls == ["deliver", "after"]
+    assert not [r for r in logs if r["event"].startswith("final.")]
+
+
+@pytest.mark.anyio
+async def test_991_failed_delivery_skips_post_delivery() -> None:
+    """A delivery that raised sent nothing: the post-return path retries the
+    whole thing, so the follow-on steps must not run ahead of the answer."""
+    calls: list[str] = []
+
+    async def deliver(evt, outcome) -> None:
+        raise RuntimeError("send failed")
+
+    async def after(evt, outcome) -> None:
+        calls.append("after")
+
+    with structlog.testing.capture_logs() as logs, anyio.fail_after(5):
+        await _run_991(deliver, after)
+
+    assert calls == []
+    assert any(r["event"] == "final.early_delivery_failed" for r in logs)
+
+
+@pytest.mark.anyio
+async def test_991_post_delivery_is_bounded_and_its_failure_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The follow-on steps are bounded too, and neither a stall nor an error
+    in them fails the run."""
+    import untether.runner_bridge as rb
+
+    monkeypatch.setattr(rb, "_EARLY_DELIVERY_TIMEOUT_S", 0.1)
+
+    async def deliver(evt, outcome) -> None:
+        return None
+
+    async def stalls(evt, outcome) -> None:
+        await anyio.sleep_forever()
+
+    async def raises(evt, outcome) -> None:
+        raise RuntimeError("status message failed")
+
+    with structlog.testing.capture_logs() as logs, anyio.fail_after(5):
+        stalled = await _run_991(deliver, stalls)
+        failed = await _run_991(deliver, raises)
+
+    assert stalled.completed is not None and failed.completed is not None
+    events = [r["event"] for r in logs]
+    assert events.count("final.post_delivery_timeout") == 1
+    assert events.count("final.post_delivery_failed") == 1
+
+
+@pytest.mark.anyio
+async def test_991_cancel_during_post_delivery_is_honoured_after_it() -> None:
+    """A /cancel landing while the follow-on steps run waits for them (they
+    are shielded, like the delivery) and is then acted on, not swallowed."""
+    from untether.runner_bridge import RunningTask, run_runner_with_cancel
+
+    runner = _TaskGroupHoldOpenRunner()
+    running_task = RunningTask()
+    in_after = anyio.Event()
+    release = anyio.Event()
+    finished = anyio.Event()
+
+    async def deliver(evt, outcome) -> None:
+        return None
+
+    async def after(evt, outcome) -> None:
+        in_after.set()
+        await release.wait()
+        finished.set()
+
+    outcomes: list[RunOutcome] = []
+
+    async def drive() -> None:
+        outcomes.append(
+            await run_runner_with_cancel(
+                runner,  # type: ignore[arg-type]
+                prompt="p",
+                resume_token=None,
+                edits=_make_edits(FakeTransport(), _KeyboardPresenter()),
+                running_task=running_task,
+                on_thread_known=None,
+                channel_id=123,
+                on_completed=deliver,
+                on_delivered=after,
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(drive)
+        with anyio.fail_after(2):
+            await in_after.wait()
+        running_task.cancel_requested.set()
+        for _ in range(20):
+            await anyio.lowlevel.checkpoint()
+        assert not outcomes, "the cancel cut the follow-on steps short"
+        release.set()
+
+    assert finished.is_set()
+    assert outcomes and outcomes[0].cancelled
+    assert runner.cleanup_ran.is_set()
 
 
 # ---------------------------------------------------------------------------

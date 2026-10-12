@@ -2496,7 +2496,128 @@ async def test_model_command_set_and_clear_chat_override(tmp_path: Path) -> None
     assert override is not None
     assert override.model is None
     assert override.reasoning == "low"
-    assert "chat model override cleared." in transport.send_calls[-1]["message"].text
+    text = transport.send_calls[-1]["message"].text
+    assert "chat model override cleared for codex." in text
+    # #998: nothing configured to fall back to, so the reply says what a
+    # resumed session may do and how to get the engine default back.
+    assert "/new" in text
+
+
+async def _clear_model(
+    cfg: TelegramBridgeConfig,
+    *,
+    topic_store: TopicStateStore | None = None,
+    chat_prefs: ChatPrefsStore | None = None,
+    thread_id: int | None = None,
+) -> None:
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=11,
+        text="/model clear",
+        reply_to_message_id=None,
+        reply_to_text=None,
+        sender_id=456,
+        chat_type="supergroup",
+        thread_id=thread_id,
+    )
+    await _handle_model_command(
+        cfg,
+        msg,
+        "clear",
+        ambient_context=None,
+        topic_store=topic_store,
+        chat_prefs=chat_prefs,
+        resolved_scope="main" if thread_id is not None else None,
+        scope_chat_ids=frozenset({123}) if thread_id is not None else None,
+    )
+
+
+@pytest.mark.anyio
+async def test_model_clear_names_the_configured_default(tmp_path: Path) -> None:
+    """#998: with `[<engine>] model` set, Untether passes it on the next run
+    (resumed or not), so the reply names it and needs no `/new`."""
+    transport = FakeTransport()
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    runner.model = "gpt-5.5"  # type: ignore[attr-defined]
+    cfg = make_cfg(transport, runner)
+    chat_prefs = ChatPrefsStore(tmp_path / "telegram_chat_prefs_state.json")
+    await chat_prefs.set_engine_override(
+        123, CODEX_ENGINE, EngineOverrides(model="gpt-4.1-mini", reasoning=None)
+    )
+
+    await _clear_model(cfg, chat_prefs=chat_prefs)
+
+    override = await chat_prefs.get_engine_override(123, CODEX_ENGINE)
+    assert override is None or override.model is None
+    text = transport.send_calls[-1]["message"].text
+    assert "chat model override cleared for codex." in text
+    assert "configured default gpt-5.5" in text
+    assert "/new" not in text
+
+
+@pytest.mark.anyio
+async def test_model_clear_without_a_default_suggests_new(tmp_path: Path) -> None:
+    """#998: no configured model means Untether passes none, and a resumed
+    session can keep the cleared model (Claude, Pi) — the reply says so."""
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    chat_prefs = ChatPrefsStore(tmp_path / "telegram_chat_prefs_state.json")
+    await chat_prefs.set_engine_override(
+        123, CODEX_ENGINE, EngineOverrides(model="gpt-4.1-mini", reasoning=None)
+    )
+
+    await _clear_model(cfg, chat_prefs=chat_prefs)
+
+    text = transport.send_calls[-1]["message"].text
+    assert "chat model override cleared for codex." in text
+    assert "resumed session may stay on the model it was using" in text
+    assert "/new" in text
+    assert "configured default" not in text
+
+
+@pytest.mark.anyio
+async def test_model_clear_topic_names_the_chat_override(tmp_path: Path) -> None:
+    """#998: clearing a topic override leaves the chat override in charge."""
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    cfg = replace(cfg, topics=TelegramTopicsSettings(enabled=True, scope="main"))
+    topic_store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    chat_prefs = ChatPrefsStore(tmp_path / "telegram_chat_prefs_state.json")
+    await topic_store.set_engine_override(
+        123, 77, CODEX_ENGINE, EngineOverrides(model="gpt-4.1", reasoning=None)
+    )
+    await chat_prefs.set_engine_override(
+        123, CODEX_ENGINE, EngineOverrides(model="gpt-4.1-mini", reasoning=None)
+    )
+
+    await _clear_model(
+        cfg, topic_store=topic_store, chat_prefs=chat_prefs, thread_id=77
+    )
+
+    text = transport.send_calls[-1]["message"].text
+    assert "topic model override cleared for codex." in text
+    assert "chat override gpt-4.1-mini" in text
+    assert "/new" not in text
+
+
+@pytest.mark.anyio
+async def test_model_clear_topic_without_any_model_suggests_new(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    cfg = replace(cfg, topics=TelegramTopicsSettings(enabled=True, scope="main"))
+    topic_store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    await topic_store.set_engine_override(
+        123, 77, CODEX_ENGINE, EngineOverrides(model="gpt-4.1", reasoning=None)
+    )
+
+    await _clear_model(cfg, topic_store=topic_store, thread_id=77)
+
+    text = transport.send_calls[-1]["message"].text
+    assert "topic model override cleared for codex." in text
+    assert "/new" in text
 
 
 @pytest.mark.anyio
@@ -3482,14 +3603,20 @@ async def test_run_main_loop_auto_resumes_chat_sessions(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("already_saved", [False, True])
 async def test_run_main_loop_prompt_upload_uses_caption_directives(
     tmp_path: Path,
+    already_saved: bool,
 ) -> None:
     payload = b"hello"
     proj_dir = tmp_path / "proj"
     other_dir = tmp_path / "other"
     proj_dir.mkdir()
     other_dir.mkdir()
+    if already_saved:
+        # #1031: an identical earlier upload is reused, not copied to `_1`.
+        (other_dir / "incoming").mkdir()
+        (other_dir / "incoming" / "hello.txt").write_bytes(payload)
 
     class _UploadBot(FakeBot):
         async def get_file(self, file_id: str) -> File | None:
@@ -3557,11 +3684,18 @@ async def test_run_main_loop_prompt_upload_uses_caption_directives(
                 raw={"file_id": "doc-1"},
             ),
         )
+        # Keep polling until the run starts: the identical-file comparison
+        # runs in a worker thread, which a finite poller's shutdown would
+        # otherwise race.
+        with anyio.move_on_after(5):
+            while not runner.calls:
+                await anyio.sleep(0.01)
 
     await run_main_loop(cfg, poller)
 
     saved_path = other_dir / "incoming" / "hello.txt"
     assert saved_path.read_bytes() == payload
+    assert [item.name for item in saved_path.parent.iterdir()] == ["hello.txt"]
     assert runner.calls
     prompt_text, _ = runner.calls[0]
     assert "do thing" in prompt_text
@@ -5540,6 +5674,102 @@ async def test_950_command_context_sees_chat_engine_default_and_bound_context(
 
 
 @pytest.mark.anyio
+async def test_997_browse_and_its_buttons_follow_the_chats_ctx_binding(
+    tmp_path: Path,
+) -> None:
+    """#997: in a chat bound by chat_id to one project and by `/ctx` to
+    another, `/browse` lists the `/ctx` project — as runs and `/file` do —
+    and a tap on one of its directory buttons stays in that project."""
+    state_path = tmp_path / "untether.toml"
+    for name in ("alpha", "beta/sub"):
+        (tmp_path / name).mkdir(parents=True)
+    (tmp_path / "alpha" / "alpha-only.txt").write_text("a")
+    (tmp_path / "beta" / "sub" / "inner.txt").write_text("b")
+    transport = FakeTransport()
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    projects = ProjectsConfig(
+        projects={
+            "alpha": ProjectConfig(
+                alias="Alpha",
+                path=tmp_path / "alpha",
+                worktrees_dir=Path(".worktrees"),
+                chat_id=123,
+            ),
+            "beta": ProjectConfig(
+                alias="Beta",
+                path=tmp_path / "beta",
+                worktrees_dir=Path(".worktrees"),
+            ),
+        },
+        default_project=None,
+        chat_map={123: "alpha"},
+    )
+    router = AutoRouter(
+        entries=[RunnerEntry(engine=runner.engine, runner=runner)],
+        default_engine=runner.engine,
+    )
+    runtime = TransportRuntime(router=router, projects=projects, config_path=state_path)
+    prefs = ChatPrefsStore(resolve_prefs_path(state_path))
+    await prefs.set_context(123, RunContext(project="beta"))
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=123,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        forward_coalesce_s=FAST_FORWARD_COALESCE_S,
+        media_group_debounce_s=FAST_MEDIA_GROUP_DEBOUNCE_S,
+    )
+
+    def keyboards() -> list[list[dict]]:
+        return [
+            [
+                b
+                for row in call["message"].extra["reply_markup"]["inline_keyboard"]
+                for b in row
+            ]
+            for call in transport.send_calls
+            if "reply_markup" in call["message"].extra
+        ]
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=123,
+            message_id=1,
+            text="/browse",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+            chat_type="private",
+        )
+        with anyio.fail_after(5):
+            while not keyboards():
+                await anyio.sleep(0.01)
+        (button,) = keyboards()[0]
+        yield TelegramCallbackQuery(
+            transport="telegram",
+            chat_id=123,
+            message_id=2,
+            callback_query_id="cb-997",
+            data=button["callback_data"],
+            sender_id=123,
+        )
+        with anyio.fail_after(5):
+            while len(transport.send_calls) < 2:
+                await anyio.sleep(0.01)
+
+    await run_main_loop(cfg, poller)
+
+    first, second = keyboards()
+    assert [b["text"] for b in first] == ["📂 sub/"]
+    assert transport.send_calls[1]["message"].text.startswith("📁 sub")
+    assert any("inner.txt" in b["text"] for b in second)
+
+
+@pytest.mark.anyio
 async def test_run_main_loop_command_defaults_to_chat_project(
     monkeypatch,
 ) -> None:
@@ -6017,8 +6247,13 @@ async def _894_run_with_reload(
     monkeypatch: pytest.MonkeyPatch,
     cfg: TelegramBridgeConfig,
     toml_after_reload: str,
+    *,
+    reloaded_telegram: dict[str, Any] | None = None,
 ) -> None:
-    """Start the loop, rewrite untether.toml, fire one reload, then stop."""
+    """Start the loop, rewrite untether.toml, fire one reload, then stop.
+
+    ``reloaded_telegram`` overrides ``[transports.telegram]`` keys in the
+    reloaded settings only, so the reload sees them as changed."""
     from untether.config_watch import ConfigReload
     from untether.runtime_loader import RuntimeSpec
     from untether.settings import TelegramTransportSettings, UntetherSettings
@@ -6026,7 +6261,10 @@ async def _894_run_with_reload(
     tg_settings = {"bot_token": "tok", "chat_id": 123, "allow_any_user": True}
     transport_config = TelegramTransportSettings.model_validate(tg_settings)
     new_settings = UntetherSettings.model_validate(
-        {"transport": "telegram", "transports": {"telegram": tg_settings}}
+        {
+            "transport": "telegram",
+            "transports": {"telegram": {**tg_settings, **(reloaded_telegram or {})}},
+        }
     )
     runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
     spec = RuntimeSpec(
@@ -6090,6 +6328,49 @@ async def test_894_reload_enabling_triggers_flags_restart_required(
     # The newly enabled project-only cron is also flagged (#894 part 2).
     fallback = [e for e in logs if e["event"] == "trigger.cron.chat_fallback"]
     assert [e["cron_id"] for e in fallback] == ["probe"]
+
+
+@pytest.mark.anyio
+async def test_1030_restart_only_key_is_announced_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A restart-only key used to be announced twice per chat (the #318
+    warning, then the #548 reload notice). It is one message now."""
+    cfg = _894_cfg(tmp_path, trigger_config=None)
+    await _894_run_with_reload(
+        monkeypatch,
+        cfg,
+        "[triggers]\nenabled = false\n",
+        reloaded_telegram={"message_overflow": "trim"},
+    )
+
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
+    notices = [
+        c for c in transport.send_calls if "message_overflow" in c["message"].text
+    ]
+    # No allowed users here, so the pending restart goes to the project chat.
+    assert [c["channel_id"] for c in notices] == [-100555]
+    assert "Restart required" in notices[0]["message"].text
+
+
+@pytest.mark.anyio
+async def test_1030_hot_reload_notice_skips_idle_project_chats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _894_cfg(tmp_path, trigger_config=None)
+    await _894_run_with_reload(
+        monkeypatch,
+        cfg,
+        "[triggers]\nenabled = false\n",
+        reloaded_telegram={"show_resume_line": False},
+    )
+
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
+    notices = [
+        c for c in transport.send_calls if "show_resume_line" in c["message"].text
+    ]
+    assert [c["channel_id"] for c in notices] == [cfg.chat_id]
+    assert "No restart needed" in notices[0]["message"].text
 
 
 @pytest.mark.anyio

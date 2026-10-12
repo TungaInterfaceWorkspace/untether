@@ -64,6 +64,7 @@ from ..runner import (
 from ..schemas import claude as claude_schema
 from ..session_quarantine import get_quarantine_store
 from ..settings import _resolve_config_path, load_settings_if_exists
+from ..utils import engine_argv
 from ..utils.env_audit import audit_proc_env
 from ..utils.json_state import atomic_write_json
 from ..utils.paths import get_run_base_dir, get_run_channel_id, get_run_sender_id
@@ -568,6 +569,9 @@ class LiveSession:
     # live" part. A close that stopped live tasks from such a turn, asked
     # for by Untether and exiting rc 0 on SIGINT, stopped cleanly (B2).
     closed_turn_idle: bool = False
+    # #887: the absolute cap was reached while a turn was running; the close
+    # is deferred to the turn boundary (logged once).
+    abs_cap_deferred: bool = False
     # #829: the tasks named when stdin was closed, and whether the
     # lifecycle has emitted its ``"closed"`` notice (once).
     close_tasks: list[str] = field(default_factory=list)
@@ -841,6 +845,8 @@ async def close_live_session(
         live_tasks=len(tasks),
         turn=live.state.turn,
         age_s=round(time.monotonic() - live.spawned_at, 1),
+        # #887: False = a turn (or an injected line) was open at the close.
+        turn_idle=live.closed_turn_idle,
         # #829: how long the background work had been quiet at the close.
         last_progress_age_s=_last_progress_age_s(live.state),
     )
@@ -868,6 +874,11 @@ async def close_live_session(
         if reason == "wake_cap":
             # #925 §14.4: the notice names the cap.
             payload["wake_cap"] = live.state.wake_cap
+        if reason == "abs_cap":
+            # #887: the notice names the limit and says whether a turn was
+            # cut short (there may be no background task to name).
+            payload["mid_turn"] = not live.closed_turn_idle
+            payload["max_s"] = live.state.live_session_max_s
         if hook_notice:
             payload["hooks"] = hooks
             payload["hook_count"] = live.close_hook_count
@@ -886,11 +897,14 @@ async def close_live_session(
 # cut short is expected, so it logs at INFO and gets no extra notice.
 _USER_CLOSE_REASONS = frozenset({"cancel", "new", "drain", "options_changed"})
 # #829 B2: Untether-initiated closes that may stop cleanly on SIGINT (rc 0,
-# transcript complete, resumable — P0 G7-G9). ``abs_cap`` closes mid-turn and
-# ``error`` follows a failed run: both keep the forced-teardown quarantine.
+# transcript complete, resumable — P0 G7-G9). ``error`` follows a failed run
+# and keeps the forced-teardown quarantine. #887: ``abs_cap`` qualifies like
+# ``max_hold`` when it closed between turns (``closed_turn_idle``, checked by
+# ``_may_stop_clean``); a turn that outlived the cap's grace does not.
 _STOPPED_CLEAN_REASONS = frozenset(
     {
         "max_hold",
+        "abs_cap",
         "cancel",
         "new",
         "drain",
@@ -6715,11 +6729,13 @@ def _register_task(
     task_id = event.task_id or ""
     task = state.tasks.get(task_id)
     created = task is None
+    revived = False
     if task is None:
         task = ClaudeTask(task_id=task_id)
         state.tasks[task_id] = task
     elif task.ended_at is not None and source == "task_started":
         _revive_task(state, task, source)
+        revived = True
     if event.task_type is not None:
         task.task_type = event.task_type
     if event.tool_use_id is not None:
@@ -6734,8 +6750,8 @@ def _register_task(
         task.owned_by_subagent = event.owned_by_subagent
     if task.holds_session:
         state.background_observed = True
-    if created or source == "task_started":
-        log = logger.info if task.is_backgrounded else logger.debug
+    log = logger.info if task.is_backgrounded else logger.debug
+    if created:
         log(
             "claude.task.registered",
             task_id=task_id,
@@ -6743,6 +6759,23 @@ def _register_task(
             is_backgrounded=task.is_backgrounded,
             owned_by_subagent=task.owned_by_subagent,
             subagent_type=task.subagent_type,
+            description=(task.description or "")[:80],
+            source=source,
+        )
+    elif source == "task_started" and not revived:
+        # #1003: the CLI's own ``task_id`` already has its registration line
+        # (the ``background_tasks_changed`` snapshot lands a moment before
+        # ``task_started``). This is the same task gaining what a snapshot
+        # entry can't say — never a second ``registered``, so counts by
+        # event name are one per task. A resumed id logs ``revived`` instead.
+        log(
+            "claude.task.confirmed",
+            task_id=task_id,
+            task_type=task.task_type,
+            is_backgrounded=task.is_backgrounded,
+            owned_by_subagent=task.owned_by_subagent,
+            subagent_type=task.subagent_type,
+            tool_use_id=task.tool_use_id,
             description=(task.description or "")[:80],
             source=source,
         )
@@ -7380,6 +7413,48 @@ def _complete_control_action(
     return state.factory.action_completed(
         action_id=action_id, kind="warning", title=title, ok=True
     )
+
+
+def _reconcile_handled_requests(state: ClaudeStreamState) -> list[UntetherEvent]:
+    """Complete the keyboard action of every request a Telegram tap answered.
+
+    ``respond_to_control_request`` and the synthetic ``da:`` claim can't reach
+    the run's state, so they record the answer in ``_HANDLED_REQUESTS`` and
+    this pass turns it into an ``action_completed`` — the only thing that
+    takes a keyboard off the progress message (#229).
+
+    #683: sweeps ``request_to_action`` as well as ``pending_control_requests``.
+    The Pause & Outline paths return their synthetic
+    ``claude.discuss_approve.N`` action early, before the request is recorded
+    as pending, so that action is reachable only through the mapping.
+
+    #771: called for every assistant and user frame, not only when another
+    control request arrives. A synthetic action has no tool call whose result
+    completes it, so after Approve Plan (which usually leaves plan mode and
+    raises no further request) its keyboard stayed up for the rest of the run.
+    """
+    events: list[UntetherEvent] = []
+    # dict.fromkeys de-dupes while preserving order.
+    handled = [
+        rid
+        for rid in dict.fromkeys(
+            (*state.pending_control_requests, *state.request_to_action)
+        )
+        if rid in _HANDLED_REQUESTS
+    ]
+    for rid in handled:
+        state.pending_control_requests.pop(rid, None)
+        # Also drops the action from control_action_for_tool, so the tool's
+        # result doesn't complete it a second time.
+        completed = _complete_control_action(state, rid, title="Permission resolved")
+        if completed is not None:
+            events.append(completed)
+        logger.debug(
+            "control_request.reconciled",
+            request_id=rid,
+            action_id=completed.action.id if completed is not None else None,
+        )
+    return events
 
 
 def _retire_superseded_discuss_approval(
@@ -8696,7 +8771,8 @@ def _translate_claude_event_base(
         case claude_schema.StreamAssistantMessage(
             message=message, parent_tool_use_id=parent_tool_use_id
         ):
-            out: list[UntetherEvent] = []
+            # #771: an answered request's keyboard goes with the next frame.
+            out: list[UntetherEvent] = _reconcile_handled_requests(state)
             for content in message.content:
                 match content:
                     case (
@@ -8794,7 +8870,8 @@ def _translate_claude_event_base(
                 compaction_frame = True
             if not isinstance(message.content, list):
                 return []
-            out: list[UntetherEvent] = []
+            # #771: before the tool results, so one isn't completed twice.
+            out: list[UntetherEvent] = _reconcile_handled_requests(state)
             saw_tool_result = False
             saw_non_tool_result = False
             for content in message.content:
@@ -9547,49 +9624,10 @@ def _translate_claude_event_base(
                     session_id=session_id,
                 )
 
-            # Reconcile requests that were handled via Telegram callback.
-            # send_claude_control_response() can't access state, so it marks
-            # handled requests in _HANDLED_REQUESTS.  We reconcile here to:
-            # 1. Remove from pending (prevents spurious expired_auto_deny)
-            # 2. Emit action_completed to clear stale inline keyboards
-            # See: https://github.com/littlebearapps/untether/issues/229
-            reconciled_events: list[UntetherEvent] = []
-            # #683: also sweep request_to_action, not just
-            # pending_control_requests. The Pause & Outline hold-open path
-            # returns its synthetic action early — before the request is
-            # recorded in pending_control_requests — so its action_id is only
-            # reachable here. dict.fromkeys de-dupes while preserving order.
-            callback_handled = [
-                rid
-                for rid in dict.fromkeys(
-                    (*state.pending_control_requests, *state.request_to_action)
-                )
-                if rid in _HANDLED_REQUESTS
-            ]
-            for rid in callback_handled:
-                state.pending_control_requests.pop(rid, None)
-                action_id_for_req = state.request_to_action.pop(rid, None)
-                if action_id_for_req:
-                    # Remove from control_action_for_tool so tool_result
-                    # doesn't try to complete it again
-                    state.control_action_for_tool = {
-                        k: v
-                        for k, v in state.control_action_for_tool.items()
-                        if v != action_id_for_req
-                    }
-                    reconciled_events.append(
-                        factory.action_completed(
-                            action_id=action_id_for_req,
-                            kind="warning",
-                            title="Permission resolved",
-                            ok=True,
-                        )
-                    )
-                logger.debug(
-                    "control_request.reconciled",
-                    request_id=rid,
-                    action_id=action_id_for_req,
-                )
+            # Reconcile requests that were handled via Telegram callback
+            # (#229, #683): drop them from pending — no spurious
+            # expired_auto_deny below — and complete their keyboard actions.
+            reconciled_events = _reconcile_handled_requests(state)
 
             # Clean up expired requests (older than timeout).
             # Send auto-deny to unblock the subprocess — without this,
@@ -10117,16 +10155,26 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         ):
             args.append(_HOOK_EVENTS_FLAG)
 
+        # #1034: validated, and joined as `--flag=value`. Claude Code reads a
+        # dash-leading token after `--resume` as another flag (2.1.296:
+        # `--resume --version` prints the version), and a resume line typed
+        # in chat reaches here; the joined form is never re-parsed.
         if resume is not None:
             if resume.is_continue:
                 args.append("--continue")
             else:
-                args.extend(["--resume", resume.value])
+                args.append(
+                    engine_argv.joined(
+                        "--resume", engine_argv.check_resume(resume.value)
+                    )
+                )
         model = self.model
         if run_options is not None and run_options.model:
             model = run_options.model
-        if model is not None:
-            args.extend(["--model", str(model)])
+        if model is not None and model != "":
+            args.append(
+                engine_argv.joined("--model", engine_argv.check_model(str(model)))
+            )
         reasoning = None
         if run_options is not None and run_options.reasoning:
             reasoning = run_options.reasoning
@@ -10878,6 +10926,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     # a wake-up's fire time) the hold waits this much longer, so the CLI's own
     # stop notice / wake turn lands before Untether would close.
     _declared_wait_grace_s: float = 60.0
+    # #887: how long past ``live_session_max_s`` a turn already running may
+    # take to reach its result before the session is closed under it.
+    _abs_cap_turn_grace_s: float = 1800.0
 
     async def _live_session_lifecycle(
         self,
@@ -10905,7 +10956,11 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         - #872, ``state.bg_hold_declared_waits``: never before a declared wait
           ends (``declared_wait_until``: a background Bash's ``timeout``, a
           pending ScheduleWakeup's fire time, + ``_declared_wait_grace_s``);
-        - ``abs_cap_s`` from spawn → notice + close (``abs_cap``).
+        - ``abs_cap_s`` from spawn → notice + close (``abs_cap``). #887: a
+          turn running at the cap is not closed under — the close waits for
+          its result (the turn boundary), for at most
+          ``_abs_cap_turn_grace_s``; only a turn still running after that is
+          closed mid-turn, always with a notice.
         Closing stdin makes the CLI stop its tasks and exit rc=0 (F3/F4). Only
         if it doesn't exit within ``_live_close_grace_s`` does
         ``_await_live_exit_or_force`` log ``close_grace_expired`` and escalate
@@ -11011,8 +11066,30 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 elif not hooks_pending:
                     state.hook_hold_logged = False
                 if abs_cap_s > 0 and now - live.spawned_at >= abs_cap_s:
-                    await close_live_session(sid, "abs_cap", notice=live_work)
-                    continue
+                    # #887: the cap bounds the process, not the turn. A turn
+                    # in flight (or a follow-up already written) gets a
+                    # bounded grace to reach its result; the session is then
+                    # closed between turns, where it stays resumable.
+                    turn_open = not live.idle or _awaiting_injected(state)
+                    over_s = now - live.spawned_at - abs_cap_s
+                    if not turn_open or over_s >= self._abs_cap_turn_grace_s:
+                        await close_live_session(
+                            sid,
+                            "abs_cap",
+                            notice=live_work or turn_open,
+                            only_if_idle=not turn_open,
+                        )
+                        continue
+                    if not live.abs_cap_deferred:
+                        live.abs_cap_deferred = True
+                        run_logger.info(
+                            "claude.live_session.abs_cap_deferred",
+                            session_id=sid,
+                            turn=state.turn,
+                            cap_s=abs_cap_s,
+                            grace_s=self._abs_cap_turn_grace_s,
+                            live_tasks=len(live_task_descriptions(state)),
+                        )
                 if not live.idle:
                     live.idle_since = None
                     live.hold_started = None
@@ -11425,7 +11502,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # background agent ignores EOF, P0 G6) may still stop cleanly on
         # SIGINT: rc 0, a complete transcript, resumable (P0 G7-G9). Its
         # quarantine is decided after the SIGINT wait instead of before it.
-        # ``abs_cap`` (mid-turn) and ``error`` never qualify.
+        # ``error`` never qualifies; ``abs_cap`` only between turns (#887).
         may_stop_clean = not idle_clean and _may_stop_clean(live)
         # #791 (a): record what the CLI was doing before any signal changes it.
         run_logger.warning(
@@ -12481,6 +12558,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if block_result is not None:
             yield block_result
             return
+        # #1034: a model / resume value the CLI could read as a flag — also
+        # before start_run, so a bad id never lands in _ACTIVE_RUNNERS.
+        refusal = self._invalid_argv_refusal(resume)
+        if refusal is not None:
+            yield refusal
+            return
 
         state = self.new_state(prompt, resume)
         self.start_run(prompt, resume, state=state)
@@ -12981,10 +13064,22 @@ def _validate_permission_mode(value: object, config_path: Path) -> str | None:
     return mode
 
 
+def _check_config_model(model: Any, config_path: Path) -> None:
+    """#1034: refuse a `[claude] model` that could read as a CLI flag."""
+    if model is None or model == "":
+        return
+    problem = engine_argv.model_problem(str(model))
+    if problem is not None:
+        raise ConfigError(
+            f"Invalid `claude.model` in {config_path}; a model id {problem}."
+        )
+
+
 def build_runner(config: EngineConfig, config_path: Path) -> Runner:
     claude_cmd = shutil.which("claude") or "claude"
 
     model = config.get("model")
+    _check_config_model(model, config_path)
     # #749 remember which branch this came from: an explicit user choice
     # survives into prompting modes, the inherited default does not.
     allowed_tools_explicit = "allowed_tools" in config

@@ -37,6 +37,8 @@ To target a specific engine, include the engine name:
 
 The override applies to the current chat (or topic, if you're in a forum thread).
 
+A model id can't start with a dash or contain spaces or control characters: `/model set` refuses such a value, and so does a run that gets one from a cron or `untether.toml` ([#1034](https://github.com/littlebearapps/untether/issues/1034)).
+
 !!! note "OpenCode: use provider/model format"
     OpenCode requires the `provider/model` format for model overrides (e.g. `openai/gpt-5.5`, `anthropic/claude-sonnet-5-5`). Using just the model name will fail. Example: `/model set opencode openai/gpt-5.5`.
 
@@ -53,6 +55,11 @@ To clear the override for a specific engine:
 ```
 /model clear claude
 ```
+
+The reply tells you what the next run gets:
+
+- **A model is configured for the engine** (`model` in its `untether.toml` table, or a chat override under the topic override you cleared): Untether passes that model on every run, resumed ones included, and the reply names it.
+- **Nothing is configured:** Untether passes no model and the engine decides. A resumed session may stay on the model it was using — Claude Code and Pi keep the session's model, while Codex resumes on its own configured model. Run `/new` to start a fresh session on the engine's default ([#998](https://github.com/littlebearapps/untether/issues/998)).
 
 ## Set reasoning level
 

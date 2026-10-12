@@ -29,6 +29,7 @@ from .background_status import (
     wake_fold_decision,
 )
 from .context import RunContext
+from .error_hints import SESSION_NOT_LOADED_HINT as _SESSION_NOT_LOADED_HINT
 from .error_hints import get_error_hint as _get_error_hint
 from .events import EventFactory
 from .logging import bind_run_context, get_logger
@@ -2330,8 +2331,14 @@ class ProgressEdits:
         self.pid: int | None = None
         self.stream: Any = None  # JsonlStreamState, set from run_runner_with_cancel
         self.cancel_event: anyio.Event | None = None  # threaded from RunningTask
+        # Render-wakeup counter: bumped by engine events AND by Untether's
+        # own repaints (heartbeats, stall-path refreshes). ``_run_loop``
+        # repaints whenever it differs from ``rendered_seq``.
         self.event_seq = 0
         self.rendered_seq = 0
+        # #994: engine events this monitor has received, and nothing else —
+        # the ``no_pid_no_events`` auto-cancel's "never started" signal.
+        self.engine_event_count = 0
         self._outline_sent: bool = False
         self._outline_refs: list[MessageRef] = []
         self._outline_just_resolved: bool = False
@@ -2402,7 +2409,7 @@ class ProgressEdits:
         4. (#777) refresh a live background-task block.
         5. (#954) otherwise, re-render when nothing has for a heartbeat
            interval, so the header's elapsed time keeps moving while the
-           engine generates silently.
+           engine generates silently — before its first event too (#1017).
         """
         stream = self.stream
         engine_state = getattr(stream, "engine_state", None) if stream else None
@@ -2482,12 +2489,14 @@ class ProgressEdits:
         #    would otherwise leave the header's elapsed time frozen. Re-render
         #    once nothing has repainted for a full heartbeat interval, so a
         #    busy run gains no edits and a silent one gains one per interval
-        #    (30 s default) — well inside Telegram's edit budget. Only once
-        #    the engine has produced an event: ``event_seq == 0`` is the
-        #    ``no_pid_no_events`` auto-cancel's "never started" signal.
+        #    (30 s default) — well inside Telegram's edit budget.
+        #    #1017: no engine event is needed first. A live follow-up turn
+        #    has its own ``ProgressEdits`` and a tool-free one emits nothing
+        #    until its answer, so it read ``0s`` throughout. (The gate that
+        #    was here protected ``no_pid_no_events``, which now counts engine
+        #    events itself — #994.)
         if (
-            self.event_seq > 0
-            and not self._finalizing
+            not self._finalizing
             and not self._is_live_session_idle()
             and now - self._last_render_at >= self._heartbeat_interval
         ):
@@ -3009,7 +3018,7 @@ class ProgressEdits:
                 auto_cancel_reason = "process_dead"
             elif (
                 self.pid is None
-                and self.event_seq == 0
+                and self.engine_event_count == 0
                 and self._stall_warn_count >= self._STALL_MAX_WARNINGS_NO_PID
             ):
                 auto_cancel_reason = "no_pid_no_events"
@@ -3068,6 +3077,7 @@ class ProgressEdits:
                     stall_warn_count=self._stall_warn_count,
                     pid=self.pid,
                     event_seq=self.event_seq,
+                    engine_events=self.engine_event_count,
                     last_event_type=(
                         self.stream.last_event_type if self.stream else None
                     ),
@@ -4780,6 +4790,7 @@ class ProgressEdits:
             )
             self._stuck_state = None
         self._last_event_at = now
+        self.engine_event_count += 1
         self.event_seq += 1
         try:
             self.signal_send.send_nowait(None)
@@ -5001,6 +5012,16 @@ class ProgressEdits:
 class ProgressMessageState:
     ref: MessageRef | None
     last_rendered: RenderedMessage | None
+    # #1029: no ``ref``, yet Telegram may have posted the message (the
+    # response was lost twice). The caller must not keep sending more.
+    unconfirmed: bool = False
+
+
+def _pop_unconfirmed_send(transport: Transport, channel_id: ChannelId) -> bool:
+    """#1029: did the transport's latest failed send to the channel end with
+    its delivery unknown? Transports that can't tell answer False."""
+    pop = getattr(transport, "pop_unconfirmed_send", None)
+    return bool(pop(channel_id)) if callable(pop) else False
 
 
 async def send_initial_progress(
@@ -5026,16 +5047,34 @@ async def send_initial_progress(
         elapsed_s=0.0,
         label=label,
     )
-    with message_kind("progress"):
-        sent_ref, _ = await _send_or_edit_message(
-            cfg.transport,
+    unconfirmed = False
+    # #1029: a send whose response was lost may or may not have been posted,
+    # and its message id is gone either way. Send once more so the run has a
+    # progress message it can edit, finalise and be cancelled from; a second
+    # lost response ends it there, so copies never pile up. A send that
+    # certainly failed is not repeated.
+    for attempt in range(2):
+        with message_kind("progress"):
+            sent_ref, _ = await _send_or_edit_message(
+                cfg.transport,
+                channel_id=channel_id,
+                message=initial_rendered,
+                edit_ref=progress_ref,
+                reply_to=reply_to,
+                notify=False,
+                replace_ref=progress_ref,
+                thread_id=thread_id,
+            )
+        unconfirmed = sent_ref is None and _pop_unconfirmed_send(
+            cfg.transport, channel_id
+        )
+        if not unconfirmed:
+            break
+        logger.warning(
+            "progress.send.unconfirmed",
             channel_id=channel_id,
-            message=initial_rendered,
-            edit_ref=progress_ref,
-            reply_to=reply_to,
-            notify=False,
-            replace_ref=progress_ref,
-            thread_id=thread_id,
+            attempt=attempt + 1,
+            resend=attempt == 0,
         )
     if sent_ref is not None:
         last_rendered = initial_rendered
@@ -5058,6 +5097,7 @@ async def send_initial_progress(
     return ProgressMessageState(
         ref=sent_ref,
         last_rendered=last_rendered,
+        unconfirmed=unconfirmed,
     )
 
 
@@ -5074,6 +5114,8 @@ class RunOutcome:
 
 #: #614/#618: the bound on the shielded early final delivery (#591). 60 s,
 #: not less — a 4-chunk final under group-chat outbox pacing takes 15 s+.
+#: #991: the steps that follow the delivery (``on_delivered``) get the same
+#: bound again, in their own scope.
 _EARLY_DELIVERY_TIMEOUT_S = 60.0
 
 
@@ -5089,6 +5131,8 @@ async def run_runner_with_cancel(
     on_completed: Callable[[CompletedEvent, RunOutcome], Awaitable[None]] | None = None,
     turn_router: FollowupTurnRouter | None = None,
     deliver_error_early: Callable[[CompletedEvent, RunOutcome], bool] | None = None,
+    on_started: Callable[[ResumeToken], None] | None = None,
+    on_delivered: Callable[[CompletedEvent, RunOutcome], Awaitable[None]] | None = None,
 ) -> RunOutcome:
     outcome = RunOutcome()
     start_time = time.monotonic()
@@ -5152,6 +5196,13 @@ async def run_runner_with_cancel(
                                 if isinstance(pid, int):
                                     edits.pid = pid
                             bind_run_stream()
+                            if on_started is not None:
+                                try:
+                                    on_started(evt.resume)
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "handle.on_started_failed", exc_info=True
+                                    )
                             if running_task is not None and running_task.resume is None:
                                 running_task.resume = evt.resume
                                 try:
@@ -5209,6 +5260,7 @@ async def run_runner_with_cancel(
                                 _record_export_event(
                                     evt, outcome.resume, channel_id=channel_id
                                 )
+                                handed_over = False
                                 try:
                                     # #614: shield the delivery — a /cancel
                                     # landing mid-send would otherwise cancel
@@ -5228,6 +5280,7 @@ async def run_runner_with_cancel(
                                         _EARLY_DELIVERY_TIMEOUT_S, shield=True
                                     ) as delivery_scope:
                                         await on_completed(evt, outcome)
+                                    handed_over = True
                                     if delivery_scope.cancelled_caught:
                                         # #928: was silent — a send that
                                         # landed then stalled (e.g. on the
@@ -5241,6 +5294,29 @@ async def run_runner_with_cancel(
                                         "final.early_delivery_failed",
                                         exc_info=True,
                                     )
+                                # #991: what follows the answer runs in its
+                                # own scope, so a delivery that used up its
+                                # bound no longer takes these steps with it.
+                                # Skipped only when the delivery raised (the
+                                # post-return path owns that retry). Shielded
+                                # and bounded like the delivery: a /cancel
+                                # waits for it and is then acted on as usual.
+                                if handed_over and on_delivered is not None:
+                                    try:
+                                        with anyio.move_on_after(
+                                            _EARLY_DELIVERY_TIMEOUT_S, shield=True
+                                        ) as after_scope:
+                                            await on_delivered(evt, outcome)
+                                        if after_scope.cancelled_caught:
+                                            logger.warning(
+                                                "final.post_delivery_timeout",
+                                                timeout_s=_EARLY_DELIVERY_TIMEOUT_S,
+                                            )
+                                    except Exception:  # noqa: BLE001
+                                        logger.warning(
+                                            "final.post_delivery_failed",
+                                            exc_info=True,
+                                        )
                                 continue
                         # A3: Record events for /export
                         _record_export_event(evt, outcome.resume, channel_id=channel_id)
@@ -5715,6 +5791,47 @@ def _format_hold_span(seconds: float) -> str:
     return f"{round(seconds / 60)} min"
 
 
+def _format_limit_span(seconds: float) -> str:
+    """#887: "4 h" / "1.5 h" / "10 min" for the session time limit."""
+    if seconds >= 3600:
+        return f"{round(seconds / 3600, 1):g} h"
+    return _format_hold_span(seconds)
+
+
+# #887: the run (or a live turn) failed because Untether closed the session at
+# ``live_session_max_s`` with the turn still running. Whether the next message
+# continues the session is only known once the process has exited — the
+# ``"closed"`` follow-up (``_live_closed_notice``) says so.
+_ABS_CAP_HINT = (
+    "Untether closed this session at its time limit (`live_session_max_s`)"
+    " before this turn finished. Claude Code did not archive or expire it"
+    " \N{EM DASH} the next note says whether your reply continues the same"
+    " session."
+)
+
+
+def _run_error_hint(
+    raw_error: str, *, usage: dict[str, Any] | None, close_reason: str | None
+) -> str | None:
+    """The hint shown with a failed run's error (#887).
+
+    ``get_error_hint`` only sees the error text; two things it cannot know:
+    - Untether itself closed the session at its time limit (``abs_cap``) —
+      say that, whatever the CLI's dying words were;
+    - ``error_during_execution`` means "the session could not be loaded"
+      (#228) only for a run that never had a turn. With a reported
+      ``num_turns`` above zero the session loaded and ran, so telling the
+      user to send /new would throw away a resumable conversation."""
+    if close_reason == "abs_cap":
+        return _ABS_CAP_HINT
+    hint = _get_error_hint(raw_error)
+    if hint == _SESSION_NOT_LOADED_HINT:
+        turns = (usage or {}).get("num_turns")
+        if isinstance(turns, int) and not isinstance(turns, bool) and turns > 0:
+            return None
+    return hint
+
+
 def _live_closing_notice(
     reason: str,
     tasks: list[str],
@@ -5723,18 +5840,31 @@ def _live_closing_notice(
     *,
     max_hold_s: float | None = None,
     rearm_on_progress: bool = True,
+    mid_turn: bool = False,
+    max_s: float | None = None,
 ) -> str:
     """User-facing text for a live session closing over running background
     tasks (#776) or background hooks (#812, automatic closes only).
 
     #829: it never promises "reply to continue" — whether the next message
     continues the same session is only known once the process has exited
-    (the ``"closed"`` follow-up, ``_live_closed_notice``)."""
+    (the ``"closed"`` follow-up, ``_live_closed_notice``).
+
+    #887: ``mid_turn`` — an ``abs_cap`` close cut a running turn short (it
+    outlived the grace after ``max_s``, the session time limit). That is
+    announced even with no task to name."""
     if hooks:
         hook_text = _live_closing_hooks_notice(hooks, hook_count)
-        if not tasks:
+        if not tasks and not (reason == "abs_cap" and mid_turn):
             return hook_text
-        return f"{hook_text}\n{_live_closing_notice(reason, tasks, max_hold_s=max_hold_s, rearm_on_progress=rearm_on_progress)}"
+        return f"{hook_text}\n{_live_closing_notice(reason, tasks, max_hold_s=max_hold_s, rearm_on_progress=rearm_on_progress, mid_turn=mid_turn, max_s=max_s)}"
+    if reason == "abs_cap" and mid_turn and not tasks:
+        span = f" ({_format_limit_span(max_s)})" if max_s else ""
+        return (
+            f"\N{HOURGLASS WITH FLOWING SAND} Closing session — it reached the "
+            f"session time limit{span} and the turn in progress didn't finish "
+            "in time. Stopping it."
+        )
     n = len(tasks)
     names = ", ".join(t[:60] for t in tasks[:3])
     if n > 3:
@@ -5909,6 +6039,9 @@ class _TurnCtx:
     detail: dict[str, Any] = field(default_factory=dict)
     edits: ProgressEdits | None = None
     progress_ref: MessageRef | None = None
+    # #1029: the turn's progress sends ended with their delivery unknown —
+    # stop asking for one, or every later action posts another copy.
+    progress_gave_up: bool = False
     edits_scope: anyio.CancelScope | None = None
     lazy_scope: anyio.CancelScope | None = None
     delivery: dict[str, bool] = field(default_factory=lambda: {"sent": False})
@@ -6060,6 +6193,8 @@ class FollowupTurnRouter:
             if self.current is not ctx:
                 return
             if ctx.edits is not None or ctx.delivery["sent"]:
+                return
+            if ctx.progress_gave_up:
                 return
             try:
                 await self._create_progress(ctx)
@@ -6961,7 +7096,17 @@ async def handle_message(
 
         if run_ok is False and run_error:
             raw_error = str(run_error)
-            hint = _get_error_hint(raw_error)
+            # #887: the hint depends on why the session ended and on whether
+            # the run had any turns, not just on the error text.
+            hint = _run_error_hint(
+                raw_error,
+                usage=completed.usage,
+                close_reason=getattr(
+                    getattr(edits.stream, "engine_state", None),
+                    "live_close_reason",
+                    None,
+                ),
+            )
             if final_answer.strip():
                 # Deduplicate: if the answer already starts with the error's
                 # first line (common when runner sets both answer and error
@@ -7488,6 +7633,20 @@ async def handle_message(
     # #829: whether this run's closing notice named tasks — only then does
     # the "closed" outcome get its own line.
     closing_named_tasks: dict[str, str] = {}
+    # #887: the listener is subscribed as soon as the session is known, so a
+    # session closed at its time limit during the FIRST turn is announced
+    # too. Until the first result opens the gate (``all``) it only passes
+    # ``abs_cap`` notices — every other notice keeps its post-result start.
+    live_notices: dict[str, bool] = {"subscribed": False, "all": False}
+
+    def _subscribe_live_notices(sid: ResumeToken | None) -> None:
+        if live_notices["subscribed"] or sid is None or runner.engine != "claude":
+            return
+        from .runners.claude import add_live_session_listener
+
+        live_notices["subscribed"] = add_live_session_listener(
+            sid.value, _on_live_notice
+        )
 
     async def _on_live_died(payload: dict[str, Any]) -> None:
         """#1001: the idle live session's process died without a close by
@@ -7535,6 +7694,8 @@ async def handle_message(
             logger.warning("live_session.notice_failed", exc_info=True)
 
     async def _on_live_notice(kind: str, payload: dict[str, Any]) -> None:
+        if not live_notices["all"] and payload.get("reason") != "abs_cap":
+            return  # #887: before the first result only the time limit speaks
         if kind == "died":
             await _on_live_died(payload)
             return
@@ -7570,7 +7731,12 @@ async def handle_message(
         )
         if hooks and hook_count is not None and hook_count <= 0:
             hooks = []  # #812: nothing was still running
-        if not tasks and not hooks:
+        # #887: a turn cut short at the session time limit is always
+        # announced — there may be no background task to name.
+        cap_mid_turn = (
+            payload.get("reason") == "abs_cap" and payload.get("mid_turn") is True
+        )
+        if not tasks and not hooks and not cap_mid_turn:
             if payload.get("reason") == "wake_cap":
                 # #925 §14.4: say why the self-paced loop stopped.
                 try:
@@ -7589,6 +7755,7 @@ async def handle_message(
                     logger.warning("live_session.notice_failed", exc_info=True)
             return
         raw_hold = payload.get("max_hold_s")
+        raw_max = payload.get("max_s")
         text = _live_closing_notice(
             str(payload.get("reason")),
             tasks,
@@ -7600,8 +7767,14 @@ async def handle_message(
                 else None
             ),
             rearm_on_progress=payload.get("rearm_on_progress") is not False,
+            mid_turn=cap_mid_turn,
+            max_s=(
+                float(raw_max)
+                if isinstance(raw_max, int | float) and not isinstance(raw_max, bool)
+                else None
+            ),
         )
-        if tasks:
+        if tasks or cap_mid_turn:
             closing_named_tasks["reason"] = str(payload.get("reason"))
         try:
             await cfg.transport.send(
@@ -7710,6 +7883,12 @@ async def handle_message(
         completed: CompletedEvent, run_outcome: RunOutcome
     ) -> None:
         await _deliver_final(completed, run_outcome)
+
+    async def _after_run_delivered(
+        completed: CompletedEvent, run_outcome: RunOutcome
+    ) -> None:
+        """What follows the run's early final. #991: its own callback, so a
+        send that outlives the early-delivery bound can't cancel these too."""
         if completed.ok is False:
             # #900: an early error final. A failed run sends no outbox files
             # (the post-return path still surfaces skipped ones), and its
@@ -7718,12 +7897,12 @@ async def handle_message(
         if not _is_live_run():
             await _budget_stop_close()  # #896
             return
-        await _deliver_outbox_now(user_ref.message_id)
+        # #991: the listener first — it never waits on Telegram, so a slow
+        # file send below can't keep the session's notices gated.
         sid = completed.resume or run_outcome.resume
-        if sid is not None and runner.engine == "claude":
-            from .runners.claude import add_live_session_listener
-
-            add_live_session_listener(sid.value, _on_live_notice)
+        live_notices["all"] = True
+        _subscribe_live_notices(sid)
+        await _deliver_outbox_now(user_ref.message_id)
         # #777: background work outlives the answer — open its status message.
         await _bg_after_turn()
         await _budget_stop_close()  # #896
@@ -7750,6 +7929,7 @@ async def handle_message(
             thread_id=incoming.thread_id,
         )
         if st.ref is None:
+            ctx.progress_gave_up = st.unconfirmed  # #1029
             return
         turn_edits = ProgressEdits(
             transport=cfg.transport,
@@ -8197,6 +8377,8 @@ async def handle_message(
                 on_completed=_on_run_completed,
                 turn_router=turn_router,
                 deliver_error_early=_deliver_error_early,
+                on_started=_subscribe_live_notices,
+                on_delivered=_after_run_delivered,
             )
         except Exception as exc:
             error = exc

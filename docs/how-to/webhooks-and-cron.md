@@ -229,7 +229,7 @@ Webhooks can perform lightweight actions without spawning an agent:
     message_template = "📈 {{ticker}} hit {{price}}"
     ```
 
-Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`. Template fields come only from the webhook payload; there are no built-in variables such as a date. A `file_write` path, like a cron `file_read` fetch, is checked at any depth against a fixed deny list (`.git/**`, `.env`, `.envrc`, `**/*.pem`, `**/.ssh/**`), so a templated path can't land in `.git/hooks` or `~/.ssh` ([#831](https://github.com/littlebearapps/untether/issues/831)). This list is separate from `[transports.telegram.files] deny_globs`. See the
+Action types: `agent_run` (default), `file_write`, `http_forward`, `notify_only`. Template fields come only from the webhook payload; there are no built-in variables such as a date. A `file_write` path, like a cron `file_read` fetch, is checked at any depth against the default `[transports.telegram.files] deny_globs` list (`.git/**`, `.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/id_rsa`, `**/.ssh/**`, `**/.netrc` and the rest), so a templated path can't land in `.git/hooks`, `~/.ssh` or `.env.local` ([#831](https://github.com/littlebearapps/untether/issues/831), [#906](https://github.com/littlebearapps/untether/issues/906)). Triggers always use the default list; a `deny_globs` value you set yourself does not change it. See the
 [triggers reference](../reference/triggers/triggers.md#non-agent-actions) for details.
 
 ## Chat routing
@@ -383,6 +383,9 @@ See the [Triggers reference — Trigger visibility](../reference/triggers/trigge
 - The server binds to localhost by default. Use a reverse proxy (nginx, Caddy) with TLS to expose it to the internet.
 - All secret comparisons use timing-safe comparison.
 - Rate limiting prevents abuse (token-bucket, per-webhook and global).
+- Use a long random secret (for example `openssl rand -hex 32`). Untether requires a secret but does not enforce a minimum length.
+- Failed auth attempts are budgeted per webhook and client address (`rate_limit` a minute). A sender that connects directly and goes over gets `429` from that webhook — even with the right secret — until the limit refills; other senders are unaffected.
+- Behind a reverse proxy or tunnel on the same host (the usual setup), every request comes from a loopback address, so Untether never refuses the right secret there: only failed attempts over the budget get `429`. That does not cap guessing — rate-limit at the proxy. Untether ignores `X-Forwarded-For`. A proxy that reaches Untether on a non-loopback address (for example a container network) is treated as one sender, so bad requests through it can lock out legitimate ones; keep the proxy on the same host. See [Triggers reference — Security](../reference/triggers/triggers.md#security).
 - Webhook prompts are prefixed with an untrusted-payload marker.
 
 ## Related
