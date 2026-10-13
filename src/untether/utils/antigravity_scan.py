@@ -75,8 +75,10 @@ What's tracked (agy set)
   (see ``_manifest_paths``). A folder passed to a hook or MCP command
   (``--root ./data``) is an argument, not config, and isn't walked;
 - agy's user-level manifests under ``~/.gemini/config/`` — stat only —
-  excluding ``plugins/untether-gate/`` and Untether's own Workspace agent
-  file (``_MANAGED_AGENT``).
+  excluding Untether's own Workspace agent file (``_MANAGED_AGENT``) by
+  exact path, and Untether's gate plugin files (``_GATE_PLUGIN_DIR``) by
+  exact path only while their content is exactly what Untether writes
+  (Untether's own files, the only ones this scan reads under ``~/.gemini``).
 
 "Not checked" whenever: a budget (entries, bytes, wall clock) runs out; a
 link under ``.agents/`` (or in ``~/.gemini/config``) leads outside both the
@@ -93,7 +95,9 @@ referenced folder that holds the project itself; a cwd so deep that the
 project root is out of reach.
 
 The cross-engine set (project root only, stat only) never refuses (REVIEW-2
-M4); it only feeds the post-run ⚠️ row.
+M4); it only feeds the post-run ⚠️ row. Claude Code's worktrees
+(``.claude/worktrees/``) aren't in it: each is its own checkout with its own
+config (#1051).
 
 Changing what is tracked changes digests: there is no digest version, so a
 project whose set gains an entry after an upgrade differs from the stored
@@ -136,13 +140,34 @@ SCAN_TIMEOUT_S = 5.0
 _CHUNK_BYTES = 256 * 1024
 _REF_PARSE_CAP_BYTES = 256 * 1024
 USER_DISPLAY_PREFIX = "~/.gemini/config/"
-_GATE_PLUGIN = "plugins/untether-gate/"
+# Untether's gate plugin (#980, ``antigravity/gate_plugin.py``), relative to
+# ``~/.gemini/config``: the files ``untether agy-gate install`` puts there
+# are left out of the digest only when their *content* is exactly what this
+# Untether writes (``gate_plugin.verified_own_files``: byte compare with its
+# own templates — Untether's own files, the one read under ``~/.gemini`` this
+# scan makes). A changed, extra or linked file is tracked like any other
+# plugin file, so nothing planted rides on the exemption.
+_GATE_PLUGIN_DIR = "plugins/untether-gate/"
+# How those files are named in ``ScanResult.agy`` (#1083: the runner's
+# plugin-changed row reports them, so the generic row leaves them out).
+GATE_PLUGIN_DISPLAY_PREFIX = USER_DISPLAY_PREFIX + _GATE_PLUGIN_DIR
 # Untether's own Workspace agent (``utils/antigravity_agent.py``), relative
 # to ``~/.gemini/config``. That exact regular file is left out of the digest:
 # Untether rewrites it to its own text before every run that names it, so
 # tracking it would hold a cron on each install or upgrade. Nothing else in
 # or beside that folder is exempt (#1043).
 _MANAGED_AGENT = "agents/untether-workspace/agent.md"
+
+
+def _own_gate_files() -> frozenset[str]:
+    """The gate plugin files (relative to ``~/.gemini/config``) whose
+    content is exactly what this Untether writes — none unless all are.
+    Lazy import: ``gate_plugin`` imports this module."""
+    from ..antigravity import gate_plugin
+
+    return frozenset(_GATE_PLUGIN_DIR + n for n in gate_plugin.verified_own_files())
+
+
 _AGENTS_DIR = ".agents"
 # Instruction trees directly under .agents/ (exact names: anything else is
 # hashed — failing towards more coverage on case-insensitive filesystems).
@@ -180,6 +205,15 @@ _CROSS_ENGINE_FILES = (
     ".git/config",
 )
 _CROSS_ENGINE_TREES = (".claude", ".github/workflows", ".husky", ".git/hooks")
+# Folders directly under a cross-engine tree that hold no config for *this*
+# project (exact names, real folders only; a link there is still recorded).
+# ``.claude/worktrees/<name>/`` is where Claude Code keeps the checkouts it
+# makes with ``--worktree`` and for isolated subagents: each is a separate
+# copy of the repo with its own config, loaded only by a session whose
+# working directory is that worktree (Claude Code 2.1.296 docs, "Run
+# parallel sessions with worktrees"). Walking them ran the budget out on
+# every run in a repo that uses them (#1051). The agy set never looks here.
+_CROSS_ENGINE_SKIP = {".claude": frozenset({"worktrees"})}
 
 # Problem reasons (shown in the ⚠️ row / refusal text).
 TOO_MANY = "too many files to check in time"
@@ -189,7 +223,12 @@ UNREADABLE = "files Untether can't read"
 VARIABLE_PATH = "a hook or MCP command path Untether can't resolve"
 TOO_LARGE = "a config file too large to check"
 CHANGING = "files changing while they were checked"
-AMBIGUOUS = "a config file agy might read differently (not strict JSON)"
+# Each reason is shown inside the row's own parentheses, so none may contain any.
+AMBIGUOUS = "a config file that isn't strict JSON, which agy might read differently"
+OTHER_FORMAT = "a config file in a format Untether can't check, such as YAML or JSONC"
+FRONT_MATTER = (
+    "an agent file whose YAML front matter Untether can't read the way agy would"
+)
 TOO_DEEP = "a project folder too deep to check"
 
 # (size, content hash | stat stamp)
@@ -346,8 +385,6 @@ def _agents_parents(cwd: Path) -> list[Path]:
 
 def _is_user_manifest(rel: str) -> bool:
     """*rel* is relative to ``~/.gemini/config``."""
-    if rel.startswith(_GATE_PLUGIN):
-        return False  # Untether's own gate plugin (rc3), trusted separately
     folded = _fold(rel)
     name = folded.rsplit("/", 1)[-1]
     if name == "hooks.json" or folded.startswith("plugins/"):
@@ -374,12 +411,16 @@ def _is_reference_manifest(path: Path, base: Path) -> bool:
     return "agents" in {_fold(part) for part in (base.name, *folders)}
 
 
+# The wall clock the time budget reads (tests swap it, #1053).
+_clock = time.monotonic
+
+
 class _Budget:
     """One per set: entries, bytes hashed, wall clock, plus the reasons the
     set couldn't be checked. Every early stop goes through here."""
 
     def __init__(self) -> None:
-        self.deadline = time.monotonic() + TIME_BUDGET_S
+        self.deadline = _clock() + TIME_BUDGET_S
         self.entries = 0
         self.bytes = 0
         self.exceeded = False
@@ -390,7 +431,7 @@ class _Budget:
         if (
             self.entries > MAX_FILES
             or self.bytes > MAX_HASH_BYTES
-            or time.monotonic() > self.deadline
+            or _clock() > self.deadline
         ):
             self.exceeded = True
         return not self.exceeded
@@ -912,7 +953,7 @@ def _scan_agents(
         if not budget.take():
             return False
         if _ALT_MANIFEST.match(_fold(path.name)):
-            budget.flag(AMBIGUOUS)
+            budget.flag(OTHER_FORMAT)
         fp, data = _fingerprint(
             path,
             budget,
@@ -1029,12 +1070,12 @@ def _scan_agents(
         if is_md:
             lines = _front_matter(data)
             if lines is None:
-                budget.flag(AMBIGUOUS)
+                budget.flag(FRONT_MATTER)
                 continue
             content = _Manifest(strings=lines)
             everywhere, commands, ambiguous = _front_matter_paths(lines)
             if ambiguous:
-                budget.flag(AMBIGUOUS)
+                budget.flag(FRONT_MATTER)
         else:
             loaded = _strict_json(data)
             if loaded is None:
@@ -1078,17 +1119,19 @@ def _plain_file(path: Path) -> bool:
 
 
 def _scan_user_level(out: dict[str, Fingerprint], budget: _Budget) -> None:
-    """Stat only — never ``open()`` anything under ``~/.gemini`` (D33).
-    Linked folders are followed while they stay in ``$HOME`` (dotfiles)."""
+    """Stat only — never ``open()`` anything under ``~/.gemini`` (D33) but
+    Untether's own gate plugin files (``_own_gate_files``). Linked folders are followed while
+    they stay in ``$HOME`` (dotfiles)."""
     user_dir = user_config_dir()
     if not os.path.isdir(user_dir):
         return
     follow = (os.path.realpath(Path.home()),)
     seen: set[str] = set()
+    own_gate = _own_gate_files()
     for path in _walk(user_dir, budget, follow_within=follow, seen=seen):
         rel = path.relative_to(user_dir).as_posix()
-        if rel.startswith(_GATE_PLUGIN):
-            continue
+        if rel in own_gate and _plain_file(path):
+            continue  # Untether's own gate plugin, unchanged: see _GATE_PLUGIN_DIR
         if rel == _MANAGED_AGENT and _plain_file(path):
             continue  # Untether's own agent, see _MANAGED_AGENT
         if not _is_user_manifest(rel) and not path.is_symlink():
@@ -1109,7 +1152,15 @@ def _scan_cross_engine(
     for tree in _CROSS_ENGINE_TREES:
         base = root / tree
         if os.path.isdir(base) and not os.path.islink(base):
-            candidates.extend(_walk(base, budget, follow_within=(), seen=seen))
+            candidates.extend(
+                _walk(
+                    base,
+                    budget,
+                    follow_within=(),
+                    seen=seen,
+                    skip_top=_CROSS_ENGINE_SKIP.get(tree, frozenset()),
+                )
+            )
         elif os.path.lexists(base):
             candidates.append(base)
         if budget.exceeded:

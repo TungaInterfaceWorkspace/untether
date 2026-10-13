@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
+import structlog
 
 from tests.telegram_fakes import FakeTransport
 from untether import runner_bridge as rb
@@ -362,7 +363,7 @@ async def test_live_backend_without_steer_falls_back_with_engine_reason(
         raise AssertionError("Claude consulted for another engine")
 
     monkeypatch.setitem(live_sessions._BACKENDS, "warm", _NoSteerLive())
-    monkeypatch.setattr(claude_mod, "get_pending_ask_request", _boom)
+    monkeypatch.setattr("untether.interactive.questions.get_pending_ask_request", _boom)
     monkeypatch.setattr(claude_mod, "get_live_session", _boom)
     cfg = _cfg("steer")
     running = {MessageRef(channel_id=CHAT, message_id=9): _Busy()}
@@ -845,7 +846,7 @@ async def test_bare_steer_on_non_claude_engine_notes_claude_only(
     await handle_followup_default_command(
         cfg, _cmd_msg("/steer"), "steer", None, None, prefs
     )
-    assert "Claude-only" in _texts(cfg)[0]
+    assert "Claude Code and Antigravity only" in _texts(cfg)[0]
 
 
 async def test_bare_command_denied_for_group_non_admin(tmp_path: Path) -> None:
@@ -954,7 +955,21 @@ async def test_config_page_renders_and_sets(tmp_path: Path) -> None:
 async def test_config_page_notice_on_other_engines(tmp_path: Path) -> None:
     ctx = _config_ctx("fu", config_path=tmp_path / "untether.toml", engine="codex")
     await ConfigCommand().handle(ctx)
-    assert "Claude Code only" in _edited(ctx).text
+    assert "Claude Code and Antigravity only" in _edited(ctx).text
+
+
+async def test_config_page_names_the_chat_engine(tmp_path: Path) -> None:
+    """#1077: an Antigravity chat's page said "while Claude is working"."""
+    path = tmp_path / "untether.toml"
+    ctx = _config_ctx("fu", config_path=path, engine="antigravity")
+    await ConfigCommand().handle(ctx)
+    text = _edited(ctx).text
+    assert "while Antigravity is working" in text
+    assert "Antigravity picks it up" in text
+    assert "Claude" not in text
+    ctx = _config_ctx("fu", config_path=path)
+    await ConfigCommand().handle(ctx)
+    assert "while Claude is working" in _edited(ctx).text
 
 
 async def test_config_page_no_config_path() -> None:
@@ -1072,3 +1087,118 @@ async def test_996_unresolvable_cwd_never_steers(
     assert out is False
     assert called == [] and pipe.sent == []
     assert rb._FOLLOWUP_ANCHORS == {}
+
+
+# ── Antigravity (#981): steer through Untether's agy plugin ────────────────
+
+AGY_CID = "c752bf1f-9d83-49ad-8a16-e3ae862e6afb"
+AGY_TOKEN = ResumeToken(engine="antigravity", value=AGY_CID)
+
+
+@pytest.fixture
+def agy_gate_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from untether.antigravity import gate_plugin, gate_server
+
+    gate_server._reset_for_tests()
+    monkeypatch.setattr(gate_plugin, "installed_ready", lambda: True)
+
+
+async def test_agy_steer_queues_into_the_running_gated_turn(
+    agy_gate_installed: None,
+) -> None:
+    from untether.antigravity import gate_server
+    from untether.events import EventFactory
+
+    gate = gate_server.GateRun(config_path=None, factory=EventFactory("antigravity"))
+    gate.set_conversation(AGY_CID)
+    gate_server._RUNS[gate.session_key] = gate
+    cfg = _cfg("steer")
+    ok = await _steer(cfg, engine="antigravity", token=AGY_TOKEN)
+    assert ok is True
+    assert _texts(cfg) == [STEERED_ACK]
+    (item,) = gate.steer_queue
+    assert item.text == "also the hostname"
+    # The anchor waits for the delivery note (or the run-end sweep).
+    assert item.command_uuid in rb._FOLLOWUP_ANCHORS
+
+
+async def test_agy_steer_without_running_turn_queues(agy_gate_installed: None) -> None:
+    cfg = _cfg("steer")
+    running = {MessageRef(channel_id=CHAT, message_id=9): _Busy()}
+    ok = await _steer(
+        cfg, engine="antigravity", token=AGY_TOKEN, override="steer", running=running
+    )
+    assert ok is False
+    assert _texts(cfg) == [fallback_notice("no_live", "antigravity")]
+    assert "Antigravity" in _texts(cfg)[0] and "Claude" not in _texts(cfg)[0]
+
+
+async def test_agy_steer_without_plugin_says_how_to_install() -> None:
+    cfg = _cfg("steer")
+    running = {MessageRef(channel_id=CHAT, message_id=9): _Busy()}
+    ok = await _steer(
+        cfg, engine="antigravity", token=AGY_TOKEN, override="steer", running=running
+    )
+    assert ok is False
+    assert "untether agy-gate install" in _texts(cfg)[0]
+    # #1077: sent as HTML, so the command shows as code, not in backticks.
+    (call,) = cfg.exec_cfg.transport.send_calls
+    assert call["message"].extra.get("parse_mode") == "HTML"
+    assert "`" not in _texts(cfg)[0]
+    assert "<code>untether agy-gate install</code>" in _texts(cfg)[0]
+
+
+async def test_agy_steer_while_the_turn_is_starting_says_so(
+    agy_gate_installed: None,
+) -> None:
+    """#1077: a steer sent before agy reported its session (so before its
+    gate is bound) said "No running Antigravity turn" while a turn was
+    starting."""
+    cfg = _cfg("steer")
+    busy = _Busy()
+    busy.resume_ready = anyio.Event()  # type: ignore[attr-defined]
+    running = {MessageRef(channel_id=CHAT, message_id=9): busy}
+    with structlog.testing.capture_logs() as logs:
+        ok = await _steer(
+            cfg,
+            engine="antigravity",
+            token=AGY_TOKEN,
+            override="steer",
+            running=running,
+        )
+    assert ok is False
+    assert _texts(cfg) == [fallback_notice("starting", "antigravity")]
+    assert "still starting" in _texts(cfg)[0]
+    assert [log["reason"] for log in logs if log["event"] == "steer.fallback"] == [
+        "starting"
+    ]
+    # Once the run has reported its session, a missing gate is "no_live".
+    busy.resume_ready.set()  # type: ignore[attr-defined]
+    cfg = _cfg("steer")
+    await _steer(
+        cfg, engine="antigravity", token=AGY_TOKEN, override="steer", running=running
+    )
+    assert _texts(cfg) == [fallback_notice("no_live", "antigravity")]
+
+
+async def test_agy_steer_after_result_falls_back(agy_gate_installed: None) -> None:
+    from untether.antigravity import gate_server
+    from untether.events import EventFactory
+
+    gate = gate_server.GateRun(config_path=None, factory=EventFactory("antigravity"))
+    gate.set_conversation(AGY_CID)
+    gate.note_result()
+    cfg = _cfg("steer")
+    assert await _steer(cfg, engine="antigravity", token=AGY_TOKEN) is False
+    assert not gate.steer_queue
+
+
+def test_agy_is_a_steer_target_not_a_live_session() -> None:
+    from untether import live_sessions
+
+    assert live_sessions.live_backend("antigravity") is None
+    assert not live_sessions.supports_live_session("antigravity")
+    target = live_sessions.steer_backend("antigravity")
+    assert target is not None and target.engine == "antigravity"
+    assert live_sessions.steer_backend("claude") is live_sessions.live_backend("claude")
+    assert live_sessions.steer_backend("codex") is None

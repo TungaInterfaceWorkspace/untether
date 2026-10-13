@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from anyio.abc import TaskGroup
@@ -24,7 +24,7 @@ from ..progress import ProgressTracker
 from ..runners.run_options import EngineRunOptions, claude_tap_waits_for
 from ..scheduler import ThreadJob, ThreadScheduler
 from ..settings import TelegramTransportSettings
-from ..transport import MessageRef, RenderedMessage, SendOptions
+from ..transport import MessageRef, RenderedMessage, SendOptions, message_kind
 from ..transport_runtime import ResolvedMessage
 from .approval_originator import note_message_sender
 from .bridge import CANCEL_CALLBACK_DATA, TelegramBridgeConfig, send_plain
@@ -142,6 +142,39 @@ def _chat_session_key(
     return (msg.chat_id, msg.sender_id)
 
 
+async def _clear_failed_session(
+    token: ResumeToken,
+    *,
+    topic_store: TopicStateStore | None,
+    topic_key: tuple[int, int] | None,
+    chat_session_store: ChatSessionStore | None,
+    chat_session_key: tuple[int, int | None] | None,
+) -> bool:
+    """Clear the saved session a failed resume named; return whether one was
+    removed (``on_resume_failed``).
+
+    #1052: compare by session id, not just engine. A stale resume line names
+    some other session, so its failure leaves the chat's (or topic's) own
+    saved session alone, and the run says nothing was cleared.
+    """
+    cleared = False
+    if topic_store is not None and topic_key is not None:
+        cleared = await topic_store.clear_engine_session(
+            topic_key[0], topic_key[1], token.engine, resume=token.value
+        )
+    if chat_session_store is not None and chat_session_key is not None:
+        cleared = (
+            await chat_session_store.clear_engine_session(
+                chat_session_key[0],
+                chat_session_key[1],
+                token.engine,
+                resume=token.value,
+            )
+            or cleared
+        )
+    return cleared
+
+
 async def _resolve_engine_run_options(
     chat_id: int,
     thread_id: int | None,
@@ -240,11 +273,14 @@ def _apply_trigger_overrides(
         # the same options the run is spawned with.
         new_options = drop_unsupported_reasoning(engine, new_options)
     if log:
+        # A run Untether starts itself with a fixed mode (an approved
+        # Antigravity plan, #981) carries no trigger; don't log it as a cron.
+        prefix = "trigger.cron" if context.trigger_source is not None else "run"
         for name, value in fields.items():
             previous = getattr(run_options, name) if run_options is not None else None
             if previous != value:
                 logger.info(
-                    f"trigger.cron.{name}_override",
+                    f"{prefix}.{name}_override",
                     trigger_source=context.trigger_source,
                     engine=engine,
                     **{f"chat_{name}": previous, f"trigger_{name}": value},
@@ -680,6 +716,7 @@ async def _cleanup_orphan_progress(cfg: TelegramBridgeConfig) -> None:
     if config_path is None:
         return
     from .progress_persistence import (
+        NOTIFY_KEY,
         clear_all_progress,
         load_active_progress,
         resolve_progress_path,
@@ -690,11 +727,16 @@ async def _cleanup_orphan_progress(cfg: TelegramBridgeConfig) -> None:
     if not entries:
         return
     logger.info("startup.orphan_cleanup", count=len(entries))
-    edited = failed = skipped = 0
+    edited = failed = skipped = notify_deleted = 0
     pop = getattr(cfg.bot, "pop_edit_error", None)
     for entry in entries.values():
         chat_id = entry.get("chat_id")
         message_id = entry.get("message_id")
+        # #1084: the card's buttons go below, so its "Action required" push
+        # would point at nothing to tap — delete it, whatever the edit does.
+        notify_id = entry.get(NOTIFY_KEY)
+        if chat_id is not None and notify_id is not None:
+            notify_deleted += await _delete_orphan_notify(cfg, chat_id, notify_id)
         if chat_id is None or message_id is None:
             skipped += 1
             continue
@@ -734,8 +776,38 @@ async def _cleanup_orphan_progress(cfg: TelegramBridgeConfig) -> None:
         edited=edited,
         failed=failed,
         skipped=skipped,
+        notify_deleted=notify_deleted,
     )
     clear_all_progress(progress_path)
+
+
+async def _delete_orphan_notify(
+    cfg: TelegramBridgeConfig, chat_id: Any, message_id: Any
+) -> int:
+    """#1084: delete an orphan card's approval push. 1 when it went, else 0;
+    a failure (already deleted, too old, corrupt id) is DEBUG, like an
+    orphan edit (#746)."""
+    try:
+        cid, mid = int(chat_id), int(message_id)
+        with message_kind("approval_notify"):
+            ok = await cfg.bot.delete_message(chat_id=cid, message_id=mid)
+    except Exception:  # noqa: BLE001 — corrupt entry (int()) or an unexpected raise
+        logger.debug(
+            "startup.orphan_cleanup.notify_delete_failed",
+            chat_id=chat_id,
+            message_id=message_id,
+            exc_info=True,
+        )
+        return 0
+    if not ok:
+        logger.debug(
+            "startup.orphan_cleanup.notify_delete_failed",
+            chat_id=cid,
+            message_id=mid,
+        )
+        return 0
+    logger.debug("startup.orphan_cleanup.notify_deleted", chat_id=cid, message_id=mid)
+    return 1
 
 
 def _init_quarantine_store(config_path: Path) -> None:
@@ -2367,22 +2439,18 @@ async def run_main_loop(
             def wrap_on_resume_failed(
                 topic_key: tuple[int, int] | None,
                 chat_session_key: tuple[int, int | None] | None,
-            ) -> Callable[[ResumeToken], Awaitable[None]] | None:
+            ) -> Callable[[ResumeToken], Awaitable[bool]] | None:
                 if topic_key is None and chat_session_key is None:
                     return None
 
-                async def _wrapped(token: ResumeToken) -> None:
-                    if state.topic_store is not None and topic_key is not None:
-                        await state.topic_store.clear_engine_session(
-                            topic_key[0], topic_key[1], token.engine
-                        )
-                    if (
-                        state.chat_session_store is not None
-                        and chat_session_key is not None
-                    ):
-                        await state.chat_session_store.clear_engine_session(
-                            chat_session_key[0], chat_session_key[1], token.engine
-                        )
+                async def _wrapped(token: ResumeToken) -> bool:
+                    return await _clear_failed_session(
+                        token,
+                        topic_store=state.topic_store,
+                        topic_key=topic_key,
+                        chat_session_store=state.chat_session_store,
+                        chat_session_key=chat_session_key,
+                    )
 
                 return _wrapped
 
@@ -3252,8 +3320,17 @@ async def run_main_loop(
                     )
 
                 if classification.is_cancel:
+                    # #1084: the 🗑️ notice above is this /cancel's reply when
+                    # it dropped a prompt — no "nothing running" as well.
                     tg.start_soon(
-                        handle_cancel, cfg, msg, state.running_tasks, scheduler
+                        partial(
+                            handle_cancel,
+                            cfg,
+                            msg,
+                            state.running_tasks,
+                            scheduler,
+                            dropped_pending=barrier_drop is not None,
+                        )
                     )
                     return
 
@@ -3440,7 +3517,7 @@ async def run_main_loop(
 
                 # A1: Intercept text as AskUserQuestion reply if one is pending
                 if text and not is_voice_transcribed:
-                    from ..runners.claude import (
+                    from ..interactive.questions import (
                         answer_ask_question,
                         answer_ask_question_with_options,
                         get_ask_question_flow,

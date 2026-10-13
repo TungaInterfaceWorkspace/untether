@@ -17,15 +17,19 @@ the subagent, timer and background rows against 1.3.3.
 | `step_update` `tool`, `DONE`, with output | `ActionEvent` completed, `ok=True`, with a 500-character output preview |
 | `step_update` `tool`, `DONE`, no output, for a tool agy can block | Held back. Closed `ok=True` when a later step arrives; turned into a ⚠️ Blocked row if `result.denied_actions` names its family |
 | `step_update` `tool`, `ERROR` | `ActionEvent` completed, `ok=False`, with `tool_info.error.message` (a hook refusal lands here) |
+| `step_update` `tool`, `DONE` with `tool_info.error` | The same as `ERROR` (a step agy stopped itself ends this way: "context canceled", [#1062](https://github.com/littlebearapps/untether/issues/1062)) |
 | `step_update` `tool` `invoke_subagent`, `ACTIVE` (agy 1.3.3) | `ActionEvent` of kind `subagent` started, titled `<type>: <role>` (`+N` for more) from `parameters.Subagents[]` |
 | `step_update` `subagent`, `ACTIVE` / `DONE` / `ERROR` | `ActionEvent` of kind `subagent`, started (1.3.1 sends this type at `ACTIVE` too) / completed |
 | `step_update` `agent_response` | No event. `text_delta` is collected per step as the fallback answer |
 | `step_update` `agent_response`, `DONE`, with `usage`, when `init.model` named a model with a known window | `ActionEvent` updated, kind `telemetry`, id `antigravity.context`, only when the percentage changed. `detail`: `context_pct`, `context_used`, `context_window`, `model`, `context_estimated: true`. It feeds the header's `~N% ctx` and is never a step ([#979](https://github.com/littlebearapps/untether/issues/979)) |
 | `step_update` `finish` (or any type) closing a step that opened as a tool | `ActionEvent` completed |
-| `step_update` `user_input`, `system_message`, `checkpoint`, `unknown`, anything newer | No event. A `user_input` injected mid-run is not a new run. A `system_message` updates the background task map (below) |
+| `step_update` `user_input`, `system_message`, `checkpoint`, `unknown`, anything newer | No event. A `user_input` injected mid-run is not a new run; with the gate, one after a steer injection adds a completed `note` action `↪️ steer received: …` (`detail.absorbed_command_uuid`, [#981](https://github.com/littlebearapps/untether/issues/981)). A `system_message` updates the background task map (below). An `ask_question` arrives as `unknown`; its card comes from the gate, not the stream (below) |
+| Gate: `PreToolUse` for `ask_question` (socket, not stdout) | `ActionEvent(started, kind="warning")` titled `❓ <question>` with `detail.request_id`, `ask_flow`, `inline_keyboard` (option buttons + Other); completed as `❓ answered: …`, `⏱️ No answer — agy carried on` or `❓ question withdrawn …` ([#980](https://github.com/littlebearapps/untether/issues/980), [runner reference](runner.md#untethers-agy-gate)) |
 | a `run_command` that counts as background, or a `schedule` / `manage_task` step `ACTIVE` for more than 5 s | `ActionEvent` updated, title `⏳ background: <command>` (once, on the next line agy prints) |
 | `result` `SUCCESS` | Open rows are closed, then `CompletedEvent(ok=True)`. Answer is `result.response`, or the collected text when that is empty |
 | `result` with `denied_actions` | A `⚠️ Blocked: <what> (<agy name>) — <title>` row per denial, and a closing paragraph on the answer |
+| `result` `SUCCESS` of a Plan first run, after a `write_to_file` `DONE` into `brain/<conversation id>/` ([#981](https://github.com/littlebearapps/untether/issues/981)) | `CompletedEvent(ok=True)`: the answer is `📋 Plan — <file>`, the plan read from that file, then agy's reply. `usage["review_card"]` = `{"text", "buttons"}` (Approve Plan / Deny / Let's discuss, callback `agy_plan:<action>:<id>`), sent by the bridge as the final's last message. A cron or webhook run gets `usage["unattended"]` (`denied: {"plan approval": 1}`, `hint`) instead of the card. No plan file: the ordinary answer plus a one-line note |
+| `result` `SUCCESS` of the run an Approve started | The answer starts `📋 Plan (approved) — <file>`; the footer label is `workspace · plan approved` |
 | Any `CompletedEvent` after ⚠️ rows | The answer gets those rows appended after it, once each, one per line (the post-run config re-check's rows included), because the final replaces the progress message that showed them ([#1045](https://github.com/littlebearapps/untether/issues/1045)). `⚠️ Blocked` rows are left out: the closing paragraph already explains them |
 | `result` `ERROR` + `interrupted` | `CompletedEvent(ok=False)`, resumable, "Antigravity was interrupted …" |
 | `result` `ERROR` + other text | `CompletedEvent(ok=False)` with agy's text, redacted and trimmed to three lines |
@@ -55,7 +59,10 @@ These yield a single `CompletedEvent(ok=False)` and keep the chat's saved sessio
 | RAM / concurrency guard | Same pre-spawn guard as every engine |
 | `no_project` | No project directory, or it is `/`, the home directory or the bot's own directory, or its path can't be resolved |
 | `invalid_argument` | The model id or the conversation id being resumed isn't a valid value (it could be read by agy as a flag). The bad id is not kept as the resume token |
-| `gate_missing` | The mode is Ask me or Plan first |
+| `gate_missing` | Ask me, and Untether's agy plugin isn't installed on the host ([#980](https://github.com/littlebearapps/untether/issues/980)) |
+| `gate_not_ready` | Ask me, and the plugin is edited, outdated or disabled, agy doesn't list its hooks for the project, the planted-config scan didn't finish, or the run's socket couldn't open |
+| `gate_self_protect` | Ask me in a project that contains Untether's own package, venv or plugin folder |
+| `gate_foreign_config` | Ask me in a project with agy hooks, plugins, agents or MCP servers Untether doesn't manage (or user-level ones) |
 | `unsupported_version` | agy is older than 1.3.1 |
 | `config_changed` | Unattended run, and the project's agy config differs from what an attended run last showed |
 | `config_unchecked` | Unattended run, and that config couldn't be checked |
@@ -74,11 +81,16 @@ own: the block is re-read whenever the progress message is drawn. Each entry is 
 | `tool` `run_command`, `ACTIVE` | `cmd:<step>` added, listed from the moment it counts as background: `IsDaemon` / `WaitMsBeforeAsync` from the parameters if present, a later `tool` / `subagent` / `agent_response` step while it is still open, else 5 s |
 | `tool` `schedule`, `ACTIVE` | `timer:<step>` added and listed at once (`timer (<DurationSeconds>s)`) |
 | `tool` `invoke_subagent` `ACTIVE`, or `subagent` `ACTIVE` / `DONE` | `sub:<step>:<n>` per subagent, listed at once as `<role> (<type>)`. `DONE` only adds the child's conversation id: the children are still working |
-| the `run_command` / `schedule` step `DONE` / `ERROR` | Removed if it never counted as background; otherwise `completed` / `failed`, and one `system_message` is expected for it |
+| the `run_command` / `schedule` step `DONE` / `ERROR` | Removed if it never counted as background; otherwise `completed` / `failed`, and one `system_message` is expected for it. A `DONE` with a cancellation error is `stopped` (⏹️), with no notice expected ([#1062](https://github.com/littlebearapps/untether/issues/1062)) |
+| `tool` `manage_task` `ACTIVE` with `Action: kill` | The `cmd:<step>` / `timer:<step>` its `TaskId` (`<cid>/task-<step>`) names → `stopped`, if still running |
 | `invoke_subagent` step `ERROR` | Its subagents → `failed` |
 | `system_message` `DONE` | Spends an expected notice if there is one; otherwise the oldest running subagent → `completed` |
 | any `tool` step `ACTIVE` | Expected notices are dropped |
 | `result`, or the run ending without one | Everything still running → `ended` (never `failed`: a daemon command is still running by design) |
+
+The state also offers two lines the bridge duck-types ([#1061](https://github.com/littlebearapps/untether/issues/1061)): `background_hold_note()`, the last line
+of the `⏳ background` block, and `cancelled_hold_note()`, added to the cancelled progress message when a listed
+task was still running at `/cancel` (agy drops an answer it is holding when it is stopped).
 
 Only `run_command`, `schedule` and `manage_task` steps count for the background wait (`awaiting_background`); a
 subagent row never does.

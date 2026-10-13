@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Any, Literal
 
 import anyio
@@ -244,10 +245,10 @@ async def _page_home(ctx: CommandContext) -> None:
     from ..chat_prefs import ChatPrefsStore, resolve_prefs_path
     from ..engine_overrides import (
         API_COST_SUPPORTED_ENGINES,
-        ASK_QUESTIONS_SUPPORTED_ENGINES,
         DIFF_PREVIEW_SUPPORTED_ENGINES,
         PERMISSION_MODE_SUPPORTED_ENGINES,
         SUBSCRIPTION_USAGE_SUPPORTED_ENGINES,
+        ask_questions_supported,
         get_engine_default_reasoning,
         get_reasoning_label,
         supports_reasoning,
@@ -341,7 +342,7 @@ async def _page_home(ctx: CommandContext) -> None:
 
     show_plan_mode = current_engine in PERMISSION_MODE_SUPPORTED_ENGINES
     show_reasoning = supports_reasoning(current_engine)
-    show_ask_questions = current_engine in ASK_QUESTIONS_SUPPORTED_ENGINES
+    show_ask_questions = ask_questions_supported(current_engine)
     show_diff_preview = current_engine in DIFF_PREVIEW_SUPPORTED_ENGINES
     show_cost_usage = (
         current_engine in API_COST_SUPPORTED_ENGINES
@@ -407,6 +408,11 @@ async def _page_home(ctx: CommandContext) -> None:
                 f"Permission mode: <b>{pm_label}</b>{pm_source}"
                 f"{_home_hint('pm', pm_label)}"
             )
+            if show_ask_questions:
+                # #980: Untether's agy plugin is installed.
+                lines.append(
+                    f"Ask mode: <b>{aq_display}</b>{_home_hint('aq', aq_label)}"
+                )
         elif current_engine == "gemini":
             lines.append("<b>Agent controls</b> <i>(Gemini CLI)</i>")
             lines.append(
@@ -447,7 +453,10 @@ async def _page_home(ctx: CommandContext) -> None:
         model_hint = f"  · {engine_hint}"
     lines.append(f"Model: <b>{model_label}</b>{model_hint}")
     lines.append(f"Listen: <b>{listen_label}</b>{_home_hint('tr', listen_label)}")
-    if current_engine == "claude":
+    if current_engine == "claude" or (
+        current_engine == "antigravity" and show_ask_questions
+    ):
+        # #981: agy steers through Untether's agy plugin (same predicate).
         lines.append(
             f"Follow-up: <b>{followup_label}</b>{_home_hint('fu', followup_label)}"
         )
@@ -593,7 +602,24 @@ async def _page_home(ctx: CommandContext) -> None:
         if show_reasoning:
             row3.append({"text": f"🧠 {home_rs_label}", "callback_data": "config:rs"})
         buttons.append(row3)
-        buttons.append([{"text": "ℹ️ About", "callback_data": "config:ab"}])
+        if current_engine == "antigravity":
+            # #980/#981: questions and steer need Untether's agy plugin; the
+            # 🔐 page says whether it is installed and how (read-only).
+            row4 = [{"text": "🔐 Telegram approvals", "callback_data": "config:gt"}]
+            if show_ask_questions:
+                row4.insert(0, {"text": "❓ Ask mode", "callback_data": "config:aq"})
+                buttons.append(row4)
+                buttons.append(
+                    [
+                        {"text": "↪️ Follow-up", "callback_data": "config:fu"},
+                        {"text": "ℹ️ About", "callback_data": "config:ab"},
+                    ]
+                )
+            else:
+                row4.append({"text": "ℹ️ About", "callback_data": "config:ab"})
+                buttons.append(row4)
+        else:
+            buttons.append([{"text": "ℹ️ About", "callback_data": "config:ab"}])
 
     # #296: a ⏰ Triggers navigation button whenever triggers are enabled
     # (even with none configured, D2 — the page explains how to add one),
@@ -687,15 +713,9 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
     # --- Antigravity permission mode actions (#558, D21) ---
     if engine == "antigravity" and action in agy_mode.ANTIGRAVITY_PM_ACTIONS:
         mode_value = agy_mode.ANTIGRAVITY_PM_ACTIONS[action]
-        if not agy_mode.ANTIGRAVITY_MODE_TEXT[mode_value].available:
-            # "· soon" button: the early-answer toast explains; store nothing.
-            logger.info(
-                "config.antigravity_permission_mode.unavailable",
-                chat_id=chat_id,
-                sender_id=ctx.message.sender_id,
-                mode=action,
-            )
-            return
+        # Ask me is stored even when the host has no Telegram approvals yet
+        # (a typed `/config pm:aga`): the run is then refused with the
+        # install hint, never run as something else (#980).
         current = await prefs.get_engine_override(chat_id, engine)
         updated = with_override(current, permission_mode=mode_value)
         await prefs.set_engine_override(chat_id, engine, updated)
@@ -749,8 +769,8 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
         await _page_home(ctx)
         return
 
-    # --- Clear (all engines) ---
-    if action == "clr":
+    # --- Clear (all engines; ``agc`` is the agy page's own, #1060) ---
+    if action == "clr" or (engine == "antigravity" and action == "agc"):
         current = await prefs.get_engine_override(chat_id, engine)
         updated = with_override(current, permission_mode=None)
         await prefs.set_engine_override(chat_id, engine, updated)
@@ -864,48 +884,75 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
         lines = [
             "<b>📋 Permission mode</b>",
             "",
-            "Antigravity runs headless, so today it can't stop to ask you."
-            " This picks what it may do on its own.",
+            # #1080: Ask me does stop to ask, so not "it can't ask you".
+            "This picks what Antigravity may do on its own, and in Ask me"
+            " what it asks you about first in Telegram.",
             "",
             "• <b>Workspace</b> — edits files in this project (and temp"
             " folders); it has no shell, web or MCP tools. Not a"
             " sandbox: a run can still write files that later runs or tools"
             " execute (default)",
-            "• <b>Ask me</b> — asks you in Telegram before shell, web and MCP"
-            " calls (coming soon: needs Untether's approval gate)",
-            "• <b>Plan first</b> — writes a plan and waits for your approval"
-            " before changing anything (coming soon: needs the gate)",
+            "• <b>Ask me</b> — reads and edits files in this project on its"
+            " own, and asks you in Telegram (with the command or a diff)"
+            " before shell commands, web, MCP, subagents and files outside"
+            " the project. A Deny, or no answer in 15 min, blocks the tool."
+            " Needs Telegram approvals on the host (🔐 below). Cron and"
+            " webhook runs only get it when the cron itself sets it",
+            "• <b>Plan first</b> — writes a plan and changes nothing; the plan"
+            " is posted with Approve / Deny / Let's discuss, and Approve"
+            " carries it out in Workspace mode. Scheduled runs only post"
+            " the plan",
             "• <b>Full access</b> — every tool is approved, including shell,"
             " network and files outside the project (agy's"
             " --dangerously-skip-permissions). Cron and webhook runs only get"
             " this when the cron itself sets it",
             "",
-            "⚠️ <b>After switching Workspace → Full access, send /new.</b> A"
-            " conversation that started in Workspace keeps its no-shell"
-            " tools; Full access applies from the next new conversation."
-            " Other changes apply from your next message.",
+            "⚠️ <b>After switching between Workspace / Plan first and Ask me"
+            " / Full access, send /new.</b> A conversation keeps the tools it"
+            " started with: one that started in Workspace or Plan first has"
+            " no shell (so Ask me would have nothing to ask about), and one"
+            " that started in Ask me or Full access keeps reaching for it,"
+            " which Workspace and Plan first then block. The new mode applies"
+            " from the next new conversation. Switching within a pair"
+            " (Workspace ↔ Plan first, Ask me ↔ Full access) applies from"
+            " your next message.",
             "",
             f"Current: <b>{current_label}</b>{agy_mode.source_suffix(agy_source)}",
             "",
             _learn_more("interactive-approval", "antigravity-cli--permission-mode"),
         ]
+        from ...antigravity import gate_plugin
+
+        # #980: no Telegram approvals on the host → "🔒 Ask me — set up",
+        # which opens their status page (install is a host command).
+        gate_ready = await anyio.to_thread.run_sync(gate_plugin.installed_ready)
         buttons = [
             [
                 {
                     "text": _check(
-                        agy_mode.button_text(action_id),
+                        agy_mode.button_text(action_id, gate_ready=gate_ready),
                         active=active_mode
                         == agy_mode.ANTIGRAVITY_PM_ACTIONS[action_id],
                     ),
-                    "callback_data": f"config:pm:{action_id}",
+                    "callback_data": (
+                        "config:gt"
+                        if action_id == "aga" and not gate_ready
+                        else f"config:pm:{action_id}"
+                    ),
                 }
                 for action_id in row
             ]
             for row in agy_mode.BUTTON_ROWS
         ]
         buttons.append(
+            [{"text": "🔐 Telegram approvals", "callback_data": "config:gt"}]
+        )
+        buttons.append(
             [
-                {"text": "Clear override", "callback_data": "config:pm:clr"},
+                {
+                    "text": "Clear override",
+                    "callback_data": "config:pm:agc",
+                },
                 {"text": "← Back", "callback_data": "config:home"},
             ]
         )
@@ -1412,14 +1459,18 @@ async def _page_followup(ctx: CommandContext, action: str | None = None) -> None
     effective = current or default
     source = "chat" if current is not None else "default"
     current_engine, _label = await _resolve_effective_engine(ctx)
+    # #1077: name the chat's engine, not Claude, in an Antigravity chat.
+    who = {"claude": "Claude", "antigravity": "Antigravity"}.get(
+        current_engine, "the agent"
+    )
 
     lines = [
         "<b>↪️ Follow-up mode</b>",
         "",
-        "What a message sent while Claude is working does.",
+        f"What a message sent while {who} is working does.",
         "",
         "• <b>queue</b> — waits for the current turn to finish, then runs (default)",
-        "• <b>steer</b> — goes straight into the running turn; Claude picks it "
+        f"• <b>steer</b> — goes straight into the running turn; {who} picks it "
         "up at its next step",
         "",
         "One-off: <code>/steer &lt;text&gt;</code> or "
@@ -1428,11 +1479,27 @@ async def _page_followup(ctx: CommandContext, action: str | None = None) -> None
         "",
         f"Current: <b>{effective}</b> ({source})",
     ]
-    if current_engine != "claude":
+    if current_engine == "antigravity":
+        from ..engine_overrides import ask_questions_supported
+
+        # #981: agy takes a steer before its next model call, through
+        # Untether's agy plugin.
         lines += [
             "",
-            f"⚠️ Steer is Claude Code only — <b>{current_engine}</b> runs "
-            "always queue follow-ups.",
+            "Antigravity: a steer reaches agy before its next step"
+            + (
+                "."
+                if ask_questions_supported(current_engine)
+                else " once Untether's agy plugin is installed on the host"
+                " (<code>untether agy-gate install</code>); until then"
+                " follow-ups queue."
+            ),
+        ]
+    elif current_engine != "claude":
+        lines += [
+            "",
+            f"⚠️ Steer is Claude Code and Antigravity only — <b>{current_engine}</b>"
+            " runs always queue follow-ups.",
         ]
     lines += ["", _learn_more("steer-follow-ups")]
 
@@ -1742,7 +1809,7 @@ async def _page_reasoning(ctx: CommandContext, action: str | None = None) -> Non
 
 async def _page_ask_questions(ctx: CommandContext, action: str | None = None) -> None:
     from ..chat_prefs import ChatPrefsStore, resolve_prefs_path
-    from ..engine_overrides import ASK_QUESTIONS_SUPPORTED_ENGINES, with_override
+    from ..engine_overrides import ask_questions_supported, with_override
 
     config_path = ctx.config_path
     if config_path is None:
@@ -1756,12 +1823,14 @@ async def _page_ask_questions(ctx: CommandContext, action: str | None = None) ->
     prefs = ChatPrefsStore(resolve_prefs_path(config_path))
     chat_id = ctx.message.channel_id
 
-    # Claude Code-only guard
+    # Claude Code, or Antigravity with Untether's agy plugin (#980)
     current_engine, _ = await _resolve_effective_engine(ctx)
-    if current_engine not in ASK_QUESTIONS_SUPPORTED_ENGINES:
+    if not ask_questions_supported(current_engine):
         await _respond(
             ctx,
-            "<b>❓ Ask mode</b>\n\nOnly available for Claude Code.",
+            "<b>❓ Ask mode</b>\n\nAvailable for Claude Code, and for"
+            " Antigravity once Untether's agy plugin is installed on the host"
+            " (<code>untether agy-gate install</code>).",
             [[{"text": "← Back", "callback_data": "config:home"}]],
         )
         return
@@ -1839,6 +1908,117 @@ async def _page_ask_questions(ctx: CommandContext, action: str | None = None) ->
         [{"text": "← Back", "callback_data": "config:home"}],
     ]
 
+    await _respond(ctx, "\n".join(lines), buttons)
+
+
+# ---------------------------------------------------------------------------
+# Antigravity: Telegram approvals gate status (#980) — read-only
+# ---------------------------------------------------------------------------
+
+
+_BACKTICK_SPAN = re.compile(r"`([^`]+)`")
+
+
+def _code_spans(text: str) -> str:
+    """#1077: escape plain text for the page, rendering its `…` spans (CLI
+    commands in shared reason texts) as <code> instead of literal backticks."""
+    return _BACKTICK_SPAN.sub(r"<code>\1</code>", html.escape(text))
+
+
+def _chat_project_cwd(ctx: CommandContext) -> Any:
+    """The folder a plain message in this chat runs agy in, or None."""
+    try:
+        context = ctx.ambient_context or ctx.runtime.default_context_for_chat(
+            ctx.message.channel_id
+        )
+        return ctx.runtime.resolve_run_cwd(context)
+    except Exception:  # noqa: BLE001 — a status line must never break /config
+        return None
+
+
+async def _page_agy_gate(ctx: CommandContext, action: str | None = None) -> None:
+    """REVIEW-2 m3: status only. Installing writes into ``~/.gemini`` and is
+    host-wide, so it is a host command, never a button. ``Re-check`` only
+    re-runs agy's own ``-p /hooks`` listing for this chat's project."""
+    from ...antigravity import gate_plugin, gate_precheck
+
+    cwd = _chat_project_cwd(ctx)
+    note: str | None = None
+    if action == "rc":
+        if cwd is None:
+            note = "No project folder for this chat, so there is nothing to check."
+        else:
+            gate_precheck.clear_cache(cwd)
+            runner, _model = _antigravity_runner_and_model(ctx, None)
+            if runner is None:
+                note = "Antigravity isn't set up on this Untether instance."
+            else:
+                with anyio.move_on_after(gate_precheck.HOOKS_TIMEOUT_S + 5):
+                    await gate_precheck.check(runner, cwd, use_cache=False)
+                logger.info(
+                    "config.agy_gate.rechecked",
+                    chat_id=ctx.message.channel_id,
+                    sender_id=ctx.message.sender_id,
+                )
+
+    install = await anyio.to_thread.run_sync(gate_plugin.inspect_install)
+    latest = gate_precheck.latest(cwd)
+    lines = [
+        "<b>🔐 Telegram approvals</b> <i>(Antigravity)</i>",
+        "",
+        "Untether's agy plugin lets an Antigravity run ask you questions"
+        " (buttons here, or reply with text), take a message while it works"
+        " (Follow-up: steer) and, in <b>Ask me</b> mode, ask before shell"
+        " commands, web, MCP and files outside the project. It only acts on"
+        " agy runs Untether starts.",
+        "",
+        f"Plugin: <b>{html.escape(install.summary())}</b>",
+    ]
+    if install.present:
+        lines.append(f"Approval and question wait: <b>{install.wait_s or '—'} s</b>")
+    if cwd is None:
+        lines.append("This chat: <i>no project folder</i>")
+    elif latest is None:
+        lines.append(
+            "This chat's project: <i>not checked yet</i> (checked before the"
+            " next Antigravity run, or tap Re-check)"
+        )
+    elif latest.ok and not install.ready:
+        # #1077: a cached pass predates the plugin's current state; runs
+        # check the plugin first, so the project isn't ready either.
+        lines.append(
+            "This chat's project: <b>not ready</b> — the plugin above isn't"
+            " ready (the last project check passed before that)"
+        )
+    elif latest.ok:
+        lines.append("This chat's project: <b>ready</b> (agy lists the hooks)")
+    else:
+        lines.append(
+            "This chat's project: <b>not ready</b> — "
+            + _code_spans(gate_precheck.reason_text(latest.reason))
+        )
+    if latest is not None and latest.foreign_sources:
+        shown = ", ".join(latest.foreign_sources[:5])
+        lines.append(f"Other agy hooks here: <code>{html.escape(shown)}</code>")
+    if note is not None:
+        lines += ["", html.escape(note)]
+    lines += [
+        "",
+        "Install writes only <code>~/.gemini/config/plugins/untether-gate/</code>"
+        " (three files), through agy's own <code>agy plugin install</code>. It"
+        " is host-wide, so it is done on the host, not from Telegram:",
+        "<code>untether agy-gate install</code>",
+        "<code>untether agy-gate uninstall</code>",
+        "<code>untether agy-gate status --project &lt;folder&gt;</code>",
+        "",
+        _learn_more("antigravity", "telegram-questions-and-steer"),
+    ]
+    buttons = [
+        [
+            {"text": "🔄 Re-check", "callback_data": "config:gt:rc"},
+            {"text": "← Back", "callback_data": "config:home"},
+        ]
+    ]
     await _respond(ctx, "\n".join(lines), buttons)
 
 
@@ -2517,6 +2697,7 @@ _PAGES: dict[str, object] = {
     "rl": _page_resume_line,
     "ab": _page_about,
     "loop": _page_loop,
+    "gt": _page_agy_gate,
 }
 
 # ---------------------------------------------------------------------------
@@ -2546,8 +2727,7 @@ _ON_OFF_CLR = frozenset({"on", "off", "clr"})
 
 _MUTATING_ACTIONS: dict[str, frozenset[str]] = {
     # Permission / approval mode for every engine, incl. Antigravity Full
-    # access (`agf`). The "· soon" Antigravity modes store nothing today but
-    # are gated with the rest so they are already covered when they ship.
+    # access (`agf`) and Ask me (`aga`, #980).
     "pm": frozenset(
         {
             *_PM_MODES,
@@ -2556,6 +2736,7 @@ _MUTATING_ACTIONS: dict[str, frozenset[str]] = {
             *agy_mode.ANTIGRAVITY_PM_ACTIONS,
             "ro",
             "clr",
+            "agc",  # #1060: the Antigravity page's own Clear override
         }
     ),
     "vb": _ON_OFF_CLR,
@@ -2574,6 +2755,8 @@ _MUTATING_ACTIONS: dict[str, frozenset[str]] = {
     ),
     "rl": _ON_OFF_CLR,
     "ab": frozenset(),
+    # #980: read-only status; Re-check (`rc`) is in _OPEN_ACTIONS.
+    "gt": frozenset(),
     "loop": _ON_OFF_CLR,
 }
 
@@ -2581,9 +2764,12 @@ _MUTATING_ACTIONS: dict[str, frozenset[str]] = {
 # `clr` / `md_clr`), so every action on them is a change.
 _DYNAMIC_ACTION_PAGES: frozenset[str] = frozenset({"ag"})
 
-# Actions that only read or navigate. None today: a page is opened with no
-# action at all.
-_OPEN_ACTIONS: dict[str, frozenset[str]] = {}
+# Actions that only read or navigate (most pages are opened with no action).
+_OPEN_ACTIONS: dict[str, frozenset[str]] = {
+    # #980: re-runs agy's own zero-token `-p /hooks` listing for this chat's
+    # project; changes no setting and writes nothing (REVIEW-2 m3).
+    "gt": frozenset({"rc"}),
+}
 
 CONFIG_ADMIN_GATE = SETTINGS_ADMIN_GATE
 
@@ -2648,12 +2834,15 @@ class ConfigCommand:
                 "ae": "Approval mode: edit files",
                 "ro": "Approval mode: read-only",
                 "safe": "Approval policy: safe",
-                # #558: Antigravity (the "· soon" modes store nothing).
-                "agw": "Permission mode: workspace",
-                # #1037: a Workspace conversation keeps its no-shell agent.
+                # #558: Antigravity. #1037 / #1060 / #980 (R3-3): a
+                # conversation keeps the agent it started with, so a switch
+                # across Workspace / Plan first ↔ Ask me / Full access
+                # needs /new.
+                "agw": agy_mode.WORKSPACE_TOAST,
                 "agf": agy_mode.FULL_ACCESS_TOAST,
-                "aga": agy_mode.GATE_SOON_TOAST,
-                "agp": agy_mode.GATE_SOON_TOAST,
+                "agc": agy_mode.CLEARED_TOAST,
+                "aga": agy_mode.ASK_TOAST,
+                "agp": agy_mode.PLAN_FIRST_TOAST,
             },
             "vb": {
                 "on": "Verbose: on",

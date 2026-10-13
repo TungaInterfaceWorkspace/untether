@@ -2,7 +2,7 @@
 name = "untether"
 authors = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
 maintainers = [{name = "Little Bear Apps", email = "hello@littlebearapps.com"}]
-version = "0.36.1rc3"
+version = "0.36.1rc4"
 keywords = ["telegram", "claude-code", "codex", "opencode", "pi", "ai-agents", "coding-assistant", "remote-control", "cli-bridge"]
 description = "Run AI coding agents from your phone. Bridges Claude Code, Codex, OpenCode, and Pi to Telegram with interactive permissions, voice input, cost tracking, and live progress."
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -67,6 +67,8 @@ telegram = "untether.telegram.backend:BACKEND"
 
 [project.entry-points."untether.command_backends"]
 claude_control = "untether.telegram.commands.claude_control:BACKEND"
+ia = "untether.telegram.commands.claude_control:IA_BACKEND"
+agy_plan = "untether.telegram.commands.antigravity_plan:BACKEND"
 usage = "untether.telegram.commands.usage:BACKEND"
 planmode = "untether.telegram.commands.planmode:BACKEND"
 ping = "untether.telegram.commands.ping:BACKEND"

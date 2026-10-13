@@ -16,7 +16,8 @@ from typing import Any
 import structlog.testing
 
 from untether.background_status import live_shown, render_background_block
-from untether.markdown import HARD_BREAK
+from untether.background_tasks import EngineBackgroundTask
+from untether.markdown import HARD_BREAK, STOPPED_STATUS, format_action_line
 from untether.model import ActionEvent, CompletedEvent
 from untether.runners.antigravity import AntigravityRunner, AntigravityStreamState
 from untether.runners.run_options import EngineRunOptions, apply_run_options
@@ -445,3 +446,191 @@ def test_task_map_is_what_the_bridge_duck_types() -> None:
     # No Claude live-session attribute came along with it.
     for name in ("live_mode", "completed_turns", "turn_open", "result_received_at"):
         assert not hasattr(state, name), name
+
+
+# ── #1062: a task agy killed itself ────────────────────────────────────────
+
+
+def test_task_killed_by_manage_task_ends_stopped_not_completed() -> None:
+    """agy 1.3.3 capture: ``manage_task`` kill ends the ``run_command`` step
+    DONE with ``tool_info.error`` "context canceled". The task reads as
+    stopped (⏹️), the log says so, and the row is not a ✓."""
+    lines = _lines("task_killed")
+    runner, state = _state()
+    _feed(runner, state, lines[:4])  # … run_command ACTIVE (step 2)
+    task = state.tasks["cmd:2"]
+    task.started_at -= 6.0
+    task.background_from -= 6.0
+    with structlog.testing.capture_logs() as logs:
+        events = _feed(runner, state, lines[4:5])  # step 2 DONE + error
+    assert task.status == "stopped" and task.ended_at is not None
+    finished = [e for e in logs if e["event"] == "antigravity.background.finished"]
+    assert [(e["task_id"], e["status"]) for e in finished] == [("cmd:2", "stopped")]
+    closed = [e for e in events if isinstance(e, ActionEvent)]
+    assert [(e.action.id, e.phase, e.ok) for e in closed] == [
+        ("step-2", "completed", False)
+    ]
+    assert closed[0].message == "context canceled"
+    # rc4 QA: the command's own row read "✗ sleep 300" (failed); it is ⏹️.
+    assert closed[0].action.detail.get("stopped") is True
+    row = format_action_line(closed[0].action, "completed", False, command_width=None)
+    assert row.startswith(STOPPED_STATUS + " ") and "✗" not in row
+    # The ⏳ block lists live tasks only, as for Claude: a stopped one leaves.
+    assert render_background_block(state.tasks.values(), now=time.monotonic()) is None
+    # The kill owes the notice, not the cancelled step (it comes next).
+    assert state.bg_notices_owed == 0
+    events = _feed(runner, state, lines[5:])
+    assert isinstance(events[-1], CompletedEvent) and events[-1].ok is True
+    assert _statuses(state) == {"cmd:2": "stopped"}
+
+
+def test_kill_before_the_step_closes_still_reads_stopped() -> None:
+    """Order-independent: if the ``manage_task`` kill arrives while the
+    command's step is still open, its task ends stopped at once."""
+    runner, state = _state()
+    _feed(
+        runner,
+        state,
+        [
+            _step(1, "agent_response", "DONE"),
+            _tool(2, "run_command", "ACTIVE", {"CommandLine": "sleep 300"}),
+        ],
+    )
+    task = state.tasks["cmd:2"]
+    task.background_from = None
+    kill = {"Action": "kill", "TaskId": f"{CID}/task-2"}
+    _feed(runner, state, [_tool(4, "manage_task", "ACTIVE", kill)])
+    assert task.status == "stopped"
+    # The step's own DONE later changes nothing.
+    _feed(runner, state, [_tool(2, "run_command", "DONE", {"CommandLine": "x"})])
+    assert task.status == "stopped"
+
+
+def test_fast_kill_still_reads_stopped_1_3_4() -> None:
+    """agy 1.3.4 capture, replayed with no delay — the rc4 QA failure: the
+    model picked ``WaitMsBeforeAsync`` 500 (not in the stream) and killed
+    the task about 4 s in, so the step's cancelled DONE arrived before the
+    default 5 s background threshold. The kill proves the command was in the
+    background: it ends stopped, not dropped as a foreground step."""
+    lines = _lines("task_killed_fast")
+    runner, state = _state()
+    _feed(runner, state, lines[:4])  # … run_command ACTIVE (step 2)
+    assert state.tasks["cmd:2"].is_backgrounded is False
+    # A subagent of an earlier step is still at work: the kill's notice
+    # must not be read as its end.
+    alpha = state.tasks["sub:1:0"] = EngineBackgroundTask(
+        task_id="sub:1:0", task_type="local_agent", description="Alpha"
+    )
+    with structlog.testing.capture_logs() as logs:
+        # step 2 DONE (cancelled), reply, kill ACTIVE + DONE, system_message
+        _feed(runner, state, lines[4:9])
+    finished = [e for e in logs if e["event"] == "antigravity.background.finished"]
+    assert [(e["task_id"], e["status"]) for e in finished] == [("cmd:2", "stopped")]
+    assert finished[0]["source"] == "manage_task"
+    task = state.tasks["cmd:2"]
+    assert task.status == "stopped" and task.is_backgrounded is True
+    assert task.ended_at is not None
+    # 1.3.4 sends the kill's ``system_message`` (step 5) at once; it is the
+    # killed task's, not Alpha's.
+    assert alpha.status == "running"
+    assert state.bg_notices_owed == 0
+    events = _feed(runner, state, lines[9:])
+    assert isinstance(events[-1], CompletedEvent) and events[-1].ok is True
+    assert _statuses(state) == {"cmd:2": "stopped", "sub:1:0": "ended"}
+
+
+def test_cancelled_step_without_a_kill_is_never_a_row() -> None:
+    """A foreground step that ends cancelled with no ``manage_task`` kill
+    after it (the run itself was stopped) stays out of the list."""
+    runner, state = _state()
+    _feed(runner, state, [_tool(2, "run_command", "ACTIVE", {"CommandLine": "x"})])
+    error = {"type": "TOOL_ERROR", "message": "context canceled"}
+    _feed(runner, state, [_tool(2, "run_command", "DONE", {}, error=error)])
+    assert state.tasks == {} and _rows(state) == []
+    # A kill naming another task changes nothing.
+    kill = {"Action": "kill", "TaskId": f"{CID}/task-7"}
+    _feed(runner, state, [_tool(3, "manage_task", "ACTIVE", kill)])
+    assert state.tasks == {} and state.bg_notices_owed == 0
+
+
+def test_failed_step_with_a_non_cancel_error_is_failed() -> None:
+    runner, state = _state()
+    _feed(runner, state, [_tool(2, "run_command", "ACTIVE", {"CommandLine": "x"})])
+    state.tasks["cmd:2"].background_from = None
+    error = {"type": "TOOL_ERROR", "message": "exec failed"}
+    events = _feed(runner, state, [_tool(2, "run_command", "DONE", {}, error=error)])
+    assert state.tasks["cmd:2"].status == "failed"
+    # #1062: only a cancellation reads ⏹️; a real failure keeps its ✗.
+    (closed,) = [e for e in events if isinstance(e, ActionEvent)]
+    assert "stopped" not in closed.action.detail
+    row = format_action_line(closed.action, "completed", False, command_width=None)
+    assert row.startswith("✗ ")
+
+
+# ── #1080: a step waiting on an Ask me approval card ───────────────────────
+
+
+def _age(state: AntigravityStreamState, key: str, seconds: float) -> None:
+    task = state.tasks[key]
+    task.started_at -= seconds
+    if task.background_from is not None:
+        task.background_from -= seconds
+
+
+def test_command_waiting_on_an_approval_card_is_not_background() -> None:
+    """rc4 QA: while an Ask me card waited, the progress message said
+    ``⏳ background (1) 🐚 git status · 1m51s``. agy hasn't run it yet."""
+    runner, state = _state("ask")
+    _feed(runner, state, [_tool(2, "run_command", "ACTIVE", {"CommandLine": "x"})])
+    state.note_approval_wait(2, True)
+    _age(state, "cmd:2", 120.0)
+    assert _rows(state) == []
+    state.note_approval_wait(2, False)  # approved: the command runs from now
+    assert _rows(state) == []
+    task = state.tasks["cmd:2"]
+    assert time.monotonic() - task.started_at < 1.0
+    _age(state, "cmd:2", 6.0)  # past the 5 s guess, still running
+    assert len(_rows(state)) == 2 and "x" in _rows(state)[1]
+
+
+def test_card_before_the_step_line_still_hides_it() -> None:
+    runner, state = _state("ask")
+    state.note_approval_wait(3, True)
+    _feed(runner, state, [_spawn(3, "Alpha")])
+    assert _rows(state) == []
+    state.note_approval_wait(3, False)
+    assert len(_rows(state)) == 2  # a subagent counts from the start
+
+
+# ── #1061: the held answer ──────────────────────────────────────────────────
+
+
+def test_hold_notes_follow_the_listed_tasks() -> None:
+    """The ``⏳ background`` block ends with the engine's note; the cancel
+    note is offered only while a listed task is still running."""
+    runner, state = _state()
+    assert state.cancelled_hold_note() is None
+    _feed(runner, state, [_tool(2, "schedule", "ACTIVE", {"DurationSeconds": 60})])
+    block = render_background_block(
+        state.tasks.values(), now=time.monotonic(), note=state.background_hold_note()
+    )
+    assert block is not None
+    assert block.split(HARD_BREAK)[-1] == (
+        "agy sends its answer when this work finishes \\(up to 30 min\\)"
+    )
+    assert state.cancelled_hold_note() == (
+        "⏳ Cancelled while agy was holding its answer for background work, so"
+        " it wasn't shown. The conversation kept it: send a message such as"
+        ' "repeat your last answer" to see it.'
+    )
+    # A command still inside its foreground window isn't listed: no note.
+    _feed(runner, state, [_tool(2, "schedule", "DONE", {}, output="ok")])
+    _feed(runner, state, [_tool(3, "run_command", "ACTIVE", {"CommandLine": "x"})])
+    assert state.cancelled_hold_note() is None
+
+
+def test_background_block_without_a_note_is_unchanged() -> None:
+    runner, state = _state()
+    _feed(runner, state, [_tool(2, "schedule", "ACTIVE", {"DurationSeconds": 60})])
+    rows = _rows(state)
+    assert len(rows) == 2 and rows[-1].startswith("🐚 timer")

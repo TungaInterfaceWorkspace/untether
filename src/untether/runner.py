@@ -125,6 +125,67 @@ class SessionLockMixin:
 PRESPAWN_BLOCKED_KEY = "prespawn_blocked"
 
 
+# #981: ``CompletedEvent.usage`` key for a decision card an engine wants
+# posted right after the final (Antigravity's Plan first card):
+# ``{"text": str, "buttons": [[{"text", "callback_data"}, …], …]}``. The bridge
+# sends it as the final's last message, after the footers.
+REVIEW_CARD_KEY = "review_card"
+
+
+def review_card(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The well-formed review card on ``usage`` (#981), or None."""
+    if not isinstance(usage, dict):
+        return None
+    card = usage.get(REVIEW_CARD_KEY)
+    if not isinstance(card, dict):
+        return None
+    text = card.get("text")
+    buttons = card.get("buttons")
+    if not isinstance(text, str) or not text or not isinstance(buttons, list):
+        return None
+    if not buttons or not all(isinstance(row, list) and row for row in buttons):
+        return None
+    return card
+
+
+# #1074: a card may carry ``"id"`` (the engine's own card id). The transport
+# reports where it posted that card (``note_review_card_ref``), so a later
+# run can retire it: ``usage[RETIRED_CARDS_KEY]`` lists ``{"id", "text"}``
+# for cards that can no longer be answered, and the bridge edits each one to
+# its ``text`` with no buttons.
+RETIRED_CARDS_KEY = "retired_cards"
+_REVIEW_CARD_REFS: dict[str, Any] = {}
+_REVIEW_CARD_REFS_MAX = 256
+
+
+def note_review_card_ref(card_id: str, ref: Any) -> None:
+    _REVIEW_CARD_REFS.pop(card_id, None)
+    _REVIEW_CARD_REFS[card_id] = ref
+    while len(_REVIEW_CARD_REFS) > _REVIEW_CARD_REFS_MAX:
+        _REVIEW_CARD_REFS.pop(next(iter(_REVIEW_CARD_REFS)))
+
+
+def pop_review_card_ref(card_id: str) -> Any:
+    return _REVIEW_CARD_REFS.pop(card_id, None)
+
+
+def retired_cards(usage: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """The well-formed ``(id, text)`` pairs on ``usage`` (#1074)."""
+    if not isinstance(usage, dict):
+        return []
+    items = usage.get(RETIRED_CARDS_KEY)
+    if not isinstance(items, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        card_id, text = item.get("id"), item.get("text")
+        if isinstance(card_id, str) and card_id and isinstance(text, str) and text:
+            out.append((card_id, text))
+    return out
+
+
 def prespawn_blocked_reason(usage: dict[str, Any] | None) -> str | None:
     """The guard-block reason marked on ``usage`` (#838), or None."""
     if not isinstance(usage, dict):
@@ -1452,6 +1513,21 @@ class JsonlSubprocessRunner(BaseRunner):
         that needs the PID (e.g. for a descendant snapshot) records it here.
         """
 
+    def check_resume_value(self, value: Any) -> str:
+        """*value* if this engine's CLI can take it as a resume value, else
+        ``EngineArgvError`` (#1034).
+
+        The default is the engine-neutral ``engine_argv.check_resume``. A
+        runner whose CLI reads more into the value narrows it — Pi opens or
+        creates a session *file* at a path (#1064), Codex starts a new
+        thread for any value that isn't a known thread (#1065) — and calls
+        the same method from ``build_args``, so the pre-spawn refusal and
+        argv never disagree.
+        """
+        from .utils import engine_argv
+
+        return engine_argv.check_resume(value)
+
     def _invalid_argv_refusal(
         self, resume: ResumeToken | None
     ) -> CompletedEvent | None:
@@ -1485,7 +1561,7 @@ class JsonlSubprocessRunner(BaseRunner):
                 (
                     "resume",
                     resume.value,
-                    engine_argv.check_resume,
+                    self.check_resume_value,
                     engine_argv.INVALID_RESUME_TEXT,
                 )
             )
@@ -1899,6 +1975,10 @@ class JsonlSubprocessRunner(BaseRunner):
             # Each collected PID's /proc start time, so the sweep refuses a
             # recycled PID (#590 hardening).
             orphan_pid_starttimes=getattr(state, "orphan_pid_starttimes", None),
+            # #1062: a cancelled run never reaches the ``subprocess.exit``
+            # line below, so the teardown logs the exit of the process it
+            # stopped. (Claude's runner spawns on its own path.)
+            log_teardown_exit=True,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

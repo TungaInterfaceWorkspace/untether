@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import os
 import re
 import signal as _signal
@@ -19,6 +20,7 @@ from .background_status import (
     FOLDABLE_REASONS,
     BackgroundStatusManager,
     count_substantive_actions,
+    escape_markdown,
     format_tokens,
     is_collection_action,
     live_shown,
@@ -32,6 +34,7 @@ from .context import RunContext
 from .error_hints import SESSION_NOT_LOADED_HINT as _SESSION_NOT_LOADED_HINT
 from .error_hints import get_error_hint as _get_error_hint
 from .events import EventFactory
+from .interactive.buttons import CONTROL_CALLBACK_PREFIXES
 from .live_sessions import live_backend
 from .logging import bind_run_context, get_logger
 from .markdown import _short_model_name, format_meta_line, render_event_cli
@@ -46,16 +49,21 @@ from .model import (
 )
 from .orphan_approvals import OrphanApprovalSurface
 from .presenter import Presenter
-from .progress import ProgressTracker
+from .progress import ProgressTracker, keyboard_action, keyboard_actions
 from .runner import (
     _APPROVAL_PENDING_REFIRE_S,
     Runner,
     RunStreamHandle,
+    _sanitise_stderr,
+    note_review_card_ref,
+    pop_review_card_ref,
     prespawn_blocked_reason,
     reset_run_stream_handle,
+    retired_cards,
+    review_card,
     set_run_stream_handle,
 )
-from .session_costs import TokenScope, token_counts
+from .session_costs import RUN_TOKENS_KEY, TokenScope, token_counts
 from .session_quarantine import QuarantineStore, get_quarantine_store
 from .transport import (
     ChannelId,
@@ -67,6 +75,7 @@ from .transport import (
     Transport,
     message_kind,
 )
+from .utils import engine_argv
 
 logger = get_logger(__name__)
 
@@ -282,14 +291,16 @@ def sweep_stale_registries(now: float | None = None) -> int:
     return pruned
 
 
-# #684: callback-data prefixes of buttons that can answer a Claude control
-# request (approval / plan buttons, AskUserQuestion options).
-_CONTROL_CALLBACK_PREFIXES = ("claude_control:", "aq:")
+# #684: callback-data prefixes of buttons that can answer a control request
+# (approval / plan buttons, question options); #960: owned by
+# ``interactive.buttons``.
+_CONTROL_CALLBACK_PREFIXES = CONTROL_CALLBACK_PREFIXES
 
 
 def control_callbacks_in(rendered: RenderedMessage | None) -> frozenset[str]:
-    """callback_data of every ``claude_control:`` / ``aq:`` button on a
-    rendered message (#684). The cancel row and other buttons are ignored."""
+    """callback_data of every ``claude_control:`` / ``aq:`` / ``ia:`` button
+    on a rendered message (#684). The cancel row and other buttons are
+    ignored."""
     if rendered is None:
         return frozenset()
     markup = rendered.extra.get("reply_markup")
@@ -890,8 +901,20 @@ _ASK_QUESTIONS_ON_TEXT = (
     "\n\nWhen you need clarification from the user, use AskUserQuestion "
     "with clear options. The user will see interactive buttons to choose from."
 )
-# Engines with no question buttons (everything but Claude until agy's
-# arrive in rc3).
+# #980: agy's own tool is ``ask_question``; its buttons need Untether's agy
+# plugin, and a question nobody can answer is skipped (the turn goes on).
+_AGY_ASK_OFF_TEXT = (
+    "\n\nDo NOT call ask_question. Proceed with reasonable defaults. "
+    "State any assumptions in your Decisions Needed summary section."
+)
+_AGY_ASK_ON_TEXT = (
+    "\n\nWhen you need clarification from the user, use the ask_question tool "
+    "with clear options. The user will see buttons in Telegram to choose from; "
+    "if no answer comes back, carry on with sensible defaults and say what "
+    "you assumed."
+)
+# Engines with no question buttons (everything but Claude, and Antigravity
+# without Untether's agy plugin).
 _REPLY_CLARIFICATION_TEXT = (
     "\n\nIf you need clarification, say so in your final reply — the user "
     "will answer in their next message."
@@ -941,17 +964,19 @@ def _apply_preamble(prompt: str, engine: str) -> str:
         return prompt
 
     from .runners.run_options import get_run_options
-    from .telegram.engine_overrides import ASK_QUESTIONS_SUPPORTED_ENGINES
+    from .telegram.engine_overrides import ask_questions_supported
+    from .utils.paths import get_run_base_dir
 
-    if engine in ASK_QUESTIONS_SUPPORTED_ENGINES:
+    if ask_questions_supported(engine, get_run_base_dir()):
         # AskUserQuestion guidance based on the per-chat toggle.
         run_opts = get_run_options()
         # Default is ON (ask_questions=None treated as True)
         ask_questions = run_opts.ask_questions if run_opts else None
+        agy = engine == "antigravity"
         if ask_questions is False:
-            text += _ASK_QUESTIONS_OFF_TEXT
+            text += _AGY_ASK_OFF_TEXT if agy else _ASK_QUESTIONS_OFF_TEXT
         else:
-            text += _ASK_QUESTIONS_ON_TEXT
+            text += _AGY_ASK_ON_TEXT if agy else _ASK_QUESTIONS_ON_TEXT
     else:
         text += _REPLY_CLARIFICATION_TEXT
 
@@ -1261,6 +1286,20 @@ def _apply_cost_delta(
     }
 
 
+def _engine_note(stream: Any, name: str) -> str | None:
+    """#1061: a short line an engine's state offers for the progress message
+    (duck-typed like ``awaiting_background``); None when it has none."""
+    probe = getattr(getattr(stream, "engine_state", None), name, None)
+    if not callable(probe):
+        return None
+    try:
+        note = probe()
+    except Exception:  # noqa: BLE001 — cosmetic; never break a render
+        logger.debug("progress_edits.engine_note_failed", note=name, exc_info=True)
+        return None
+    return note if isinstance(note, str) and note else None
+
+
 # #419: engines whose CompletedEvent token usage needs the session ledger.
 # Codex's turn.completed.usage is the thread's running total (every earlier
 # ``exec resume`` run included), so runs report the delta.
@@ -1292,9 +1331,15 @@ def _apply_token_delta(
         return usage
     from .session_costs import get_session_cost_ledger
 
+    run_tokens = usage.get(RUN_TOKENS_KEY)
     try:
         result = get_session_cost_ledger().record_tokens(
-            engine, session_id, counts, scope=scope, resumed=resumed
+            engine,
+            session_id,
+            counts,
+            scope=scope,
+            resumed=resumed,
+            run_tokens=run_tokens if isinstance(run_tokens, Mapping) else None,
         )
     except Exception:  # noqa: BLE001 — accounting must never break delivery
         logger.warning("usage.token_delta_failed", exc_info=True)
@@ -1903,6 +1948,62 @@ def _insert_into_chunk(msg: RenderedMessage, insertion: str) -> RenderedMessage:
     return RenderedMessage(text=text[:idx] + insertion + text[idx:], extra=extra)
 
 
+def _append_review_card(
+    msg: RenderedMessage, usage: Mapping[str, Any] | None
+) -> RenderedMessage:
+    """#981: add the engine's review card (``usage[REVIEW_CARD_KEY]``) as a
+    trailing follow-up message carrying its own buttons. The final's own
+    chunks keep their markup, so the card is the only message with buttons."""
+    card = review_card(dict(usage) if usage is not None else None)
+    if card is None:
+        return msg
+    followups = msg.extra.get("followups")
+    existing = (
+        [f for f in followups if isinstance(f, RenderedMessage)]
+        if isinstance(followups, list)
+        else []
+    )
+    extra: dict[str, Any] = {
+        "entities": [],
+        "reply_markup": {"inline_keyboard": card["buttons"]},
+    }
+    card_id = card.get("id")
+    if isinstance(card_id, str) and card_id:
+        # #1074: remember where it landed, so a newer card can retire it.
+        extra["on_sent"] = functools.partial(note_review_card_ref, card_id)
+    chunk = RenderedMessage(text=card["text"], extra=extra)
+    return RenderedMessage(
+        text=msg.text, extra={**msg.extra, "followups": [*existing, chunk]}
+    )
+
+
+async def _retire_review_cards(
+    transport: Transport, usage: Mapping[str, Any] | None
+) -> None:
+    """#1074: edit each card the engine says can no longer be answered (a
+    newer plan replaced it) to its closing text, without buttons. A card
+    whose message isn't known (sent before a restart, or never confirmed) is
+    left for its tap to retire."""
+    for card_id, text in retired_cards(dict(usage) if usage is not None else None):
+        ref = pop_review_card_ref(card_id)
+        if ref is None:
+            continue
+        try:
+            with message_kind("review_card"):
+                await transport.edit(
+                    ref=ref,
+                    message=RenderedMessage(
+                        text=text,
+                        extra={"entities": [], "reply_markup": {"inline_keyboard": []}},
+                    ),
+                    wait=False,
+                )
+        except Exception:  # noqa: BLE001 — the old card is cosmetic
+            logger.debug("review_card.retire_failed", card_id=card_id, exc_info=True)
+            continue
+        logger.info("review_card.retired", card_id=card_id)
+
+
 def _insert_footer_line(msg: RenderedMessage, insertion: str) -> RenderedMessage:
     """Add a footer line (cost, budget alert, #702 outlier, usage) to a final.
 
@@ -2004,7 +2105,11 @@ def _unattended_footer(unattended: Mapping[str, Any]) -> str:
     _UNATTENDED_HINTED[trigger] = None
     while len(_UNATTENDED_HINTED) > _UNATTENDED_HINTED_MAX:
         _UNATTENDED_HINTED.pop(next(iter(_UNATTENDED_HINTED)))
-    if unattended.get("mode") in _UNATTENDED_ASK_CLASS_MODES:
+    custom = unattended.get("hint")
+    if isinstance(custom, str) and custom:
+        # #981: the engine knows its own remedy (Antigravity's modes differ).
+        hint = custom
+    elif unattended.get("mode") in _UNATTENDED_ASK_CLASS_MODES:
         hint = (
             "these always ask (an ask rule, a hook, a tool that needs a person, "
             "or auto mode falling back after repeated blocks) \N{EM DASH} "
@@ -2289,6 +2394,14 @@ def engine_background_busy(engine_state: Any) -> bool:
     except Exception as exc:  # noqa: BLE001 - monitor loop must not die
         logger.debug("engine_background_busy.probe_failed", error=str(exc))
     return False
+
+
+# #1077: the push sent with a question card names the engine asking.
+_QUESTION_ENGINE_NAMES = {"claude": "Claude Code", "antigravity": "Antigravity"}
+
+
+def question_notify_text(engine: str) -> str:
+    return f"Question from {_QUESTION_ENGINE_NAMES.get(engine, engine)}"
 
 
 class ProgressEdits:
@@ -4076,9 +4189,10 @@ class ProgressEdits:
     def _pending_request_info(self) -> _PendingRequestInfo | None:
         """#919: classify the pending request the reminder is about.
 
-        Engine registry first (``control_request_snapshot()``, newest request
-        wins — the one whose buttons are visible), else the newest uncompleted
-        tracked action carrying an inline keyboard.
+        Engine registry first (``control_request_snapshot()``: the request
+        whose buttons are visible, #1079 ``keyboard_actions`` order, else the
+        newest), else the first tracked action with an inline keyboard in that
+        order.
         """
         # #929: requests on the run's standalone approval surface are not
         # this turn's to remind about — remind about the newest other one.
@@ -4086,8 +4200,17 @@ class ProgressEdits:
         snaps = [
             s for s in (self._control_snapshots() or []) if s.request_id not in excluded
         ]
+        shown = keyboard_actions(self.tracker._actions.values())
         if snaps:
-            snap = min(snaps, key=lambda s: s.age_s)
+            by_id = {s.request_id: s for s in snaps}
+            snap = next(
+                (
+                    by_id[rid]
+                    for a in shown
+                    if (rid := a.action.detail.get("request_id")) in by_id
+                ),
+                None,
+            ) or min(snaps, key=lambda s: s.age_s)
             tool_name = snap.tool_name or None
             if snap.kind == "ask":
                 return _PendingRequestInfo(
@@ -4107,12 +4230,8 @@ class ProgressEdits:
             return _PendingRequestInfo(
                 kind=kind, request_id=snap.request_id, tool_name=tool_name
             )
-        for action_state in reversed(list(self.tracker._actions.values())):
-            if action_state.completed:
-                continue
+        for action_state in shown:
             detail = action_state.action.detail
-            if not detail.get("inline_keyboard"):
-                continue
             rid = detail.get("request_id")
             rid = rid if isinstance(rid, str) and rid else None
             if rid is not None and rid in excluded:
@@ -4552,21 +4671,18 @@ class ProgressEdits:
             # uncompleted for the whole run, so this `any()` stayed True and
             # stripped EVERY later approval keyboard down to the cancel row —
             # an AskUserQuestion rendered its question text with no option
-            # buttons and the run was unanswerable. Matches the newest-first
-            # convention in TelegramPresenter.render_progress and
-            # _has_pending_approval.
+            # buttons and the run was unanswerable. #1079: the same choice as
+            # TelegramPresenter.render_progress (``keyboard_action``).
             _current_is_outline = False
             _kb_tool: str | None = None  # #822
             _kb_request_id: str | None = None
-            for _a in reversed(state.actions):
-                if _a.completed or not _a.action.detail.get("inline_keyboard"):
-                    continue
+            _a = keyboard_action(state.actions)
+            if _a is not None:
                 _current_is_outline = (
                     _a.action.detail.get("request_type") == "DiscussApproval"
                 )
                 _kb_tool = _a.action.detail.get("tool_name")
                 _kb_request_id = _a.action.detail.get("request_id")
-                break
             if self._outline_sent and has_approval and _current_is_outline:
                 cancel_row = new_kb[-1:]  # keep only the cancel row
                 rendered = RenderedMessage(
@@ -4583,6 +4699,7 @@ class ProgressEdits:
                 # doesn't need another "Action required" push.
                 self._outline_just_resolved = True
 
+            pending_notify: str | None = None
             try:
                 # Send full outline as separate message(s) when approval buttons appear
                 if has_approval and not had_approval and not self._outline_sent:
@@ -4628,35 +4745,20 @@ class ProgressEdits:
                         notify_text = "Action required \u2014 approval needed"
                         for a in state.actions:
                             if not a.completed and a.action.detail.get("ask_question"):
-                                notify_text = "Question from Claude Code"
+                                notify_text = question_notify_text(self.tracker.engine)
                                 break
 
-                        async def _send_notify(text: str) -> None:
-                            try:
-                                with message_kind("approval_notify"):
-                                    self._approval_notify_ref = (
-                                        await self.transport.send(
-                                            channel_id=self.channel_id,
-                                            message=RenderedMessage(text=text),
-                                            options=SendOptions(
-                                                notify=True,
-                                                reply_to=self.progress_ref,
-                                                thread_id=self.thread_id,
-                                            ),
-                                        )
-                                    )
-                            except Exception:  # noqa: BLE001
-                                logger.debug(
-                                    "progress_edits.notify_send_failed",
-                                    exc_info=True,
-                                )
-
-                        bg_tg.start_soon(_send_notify, notify_text)
+                        # #1083: sent after this cycle's edit (below) has
+                        # landed. The outbox sends a new message before a
+                        # pending edit, so starting it here let the push
+                        # arrive seconds before the buttons it points at.
+                        pending_notify = notify_text
                 elif had_approval and not has_approval:
                     ref_to_delete = self._approval_notify_ref
                     self._approval_notify_ref = None
                     self._approval_notified = False
                     if ref_to_delete is not None:
+                        self._persist_approval_notify(None)
 
                         async def _delete_notify(ref: MessageRef) -> None:
                             try:
@@ -4744,8 +4846,47 @@ class ProgressEdits:
                 # Transport errors (timeouts, network issues) are best-effort —
                 # never crash a run because a progress edit failed to send.
                 logger.warning("progress_edits.transport_error", exc_info=True)
+            if pending_notify is not None:
+                bg_tg.start_soon(self._send_approval_notify, pending_notify)
 
             self.rendered_seq = seq_at_render
+
+    async def _send_approval_notify(self, text: str) -> None:
+        """The "Action required" push, a reply to the progress message."""
+        try:
+            with message_kind("approval_notify"):
+                self._approval_notify_ref = await self.transport.send(
+                    channel_id=self.channel_id,
+                    message=RenderedMessage(text=text),
+                    options=SendOptions(
+                        notify=True,
+                        reply_to=self.progress_ref,
+                        thread_id=self.thread_id,
+                    ),
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("progress_edits.notify_send_failed", exc_info=True)
+            return
+        if self._approval_notify_ref is not None:
+            self._persist_approval_notify(self._approval_notify_ref.message_id)
+
+    def _persist_approval_notify(self, message_id: int | None) -> None:
+        """#1084: keep the approval push beside its progress message in
+        ``active_progress.json`` (``None`` forgets it), so a restart's orphan
+        cleanup deletes the push along with the card's buttons. A progress
+        message that isn't tracked (already released) is left alone."""
+        if _PROGRESS_PERSISTENCE_PATH is None or self.progress_ref is None:
+            return
+        from .telegram.progress_persistence import set_progress_notify
+
+        try:
+            set_progress_notify(
+                _PROGRESS_PERSISTENCE_PATH,
+                f"{self.channel_id}:{self.progress_ref.message_id}",
+                message_id,
+            )
+        except Exception:  # noqa: BLE001 — persistence is best-effort
+            logger.debug("progress_edits.notify_persist_failed", exc_info=True)
 
     _STALL_THRESHOLD_SECONDS: float = 300.0  # 5 minutes
     _STALL_THRESHOLD_TOOL: float = 600.0  # 10 minutes when a tool is actively running
@@ -5026,6 +5167,7 @@ class ProgressEdits:
                     error_type=exc.__class__.__name__,
                 )
             self._approval_notify_ref = None
+            self._persist_approval_notify(None)
         # #920: then the pending-approval reminder (run end / turn close).
         await self._retire_approval_reminder("run_end")
         # #929: then (run-level only — turn edits share the reference) the
@@ -5208,6 +5350,19 @@ async def run_runner_with_cancel(
     on_delivered: Callable[[CompletedEvent, RunOutcome], Awaitable[None]] | None = None,
 ) -> RunOutcome:
     outcome = RunOutcome()
+    if running_task is not None and running_task.cancel_requested.is_set():
+        # #1082: /cancel (or /new) arrived while the run was starting — its
+        # progress message was still being sent. Never spawn the engine; the
+        # caller renders the usual cancelled card, naming the session.
+        logger.info(
+            "handle.cancelled_before_start",
+            channel_id=channel_id,
+            engine=runner.engine,
+            resume=resume_token.value if resume_token else None,
+        )
+        outcome.cancelled = True
+        outcome.resume = resume_token
+        return outcome
     start_time = time.monotonic()
     runner_finished = anyio.Event()
     # #510: this run's own stream + pid. The runner instance is shared
@@ -5530,23 +5685,29 @@ async def run_runner_with_cancel(
     if event_count == 0 and not outcome.cancelled:
         # #1047: a refusal answered before anything was meant to start has
         # no events by design — INFO, with the reason, not a WARNING.
-        plain_block = _plain_prespawn_refusal(
+        # #1082: so is a refused invalid session/model id (the user's input).
+        info_block = prespawn_blocked_reason(
             outcome.completed.usage if outcome.completed else None
         )
-        if plain_block is not None:
+        if info_block in _INFO_PRESPAWN_BLOCKS:
             logger.info(
                 "session.summary.no_events",
                 session_id=outcome.resume.value if outcome.resume else None,
                 engine=runner.engine,
                 duration_seconds=round(duration, 1),
-                prespawn_blocked=plain_block,
+                prespawn_blocked=info_block,
             )
         else:
+            # #1084: the other pre-spawn refusals stay WARNING — a held
+            # schedule (``config_changed``), RAM or concurrency refusal is
+            # something the operator should see — but carry the reason, so
+            # the line says why nothing ran.
             logger.warning(
                 "session.summary.no_events",
                 session_id=outcome.resume.value if outcome.resume else None,
                 engine=runner.engine,
                 duration_seconds=round(duration, 1),
+                **({"prespawn_blocked": info_block} if info_block else {}),
             )
 
     return outcome
@@ -5563,6 +5724,11 @@ def _hook_summary_fields(stream: Any) -> dict[str, Any]:
         if isinstance(value, int) and not isinstance(value, bool):
             fields[key] = value
     return fields
+
+
+def _session_token(token: ResumeToken | None) -> ResumeToken | None:
+    """*token* when it names a session — not ``/continue``'s (#1084)."""
+    return token if token is not None and not token.is_continue else None
 
 
 def sync_resume_token(
@@ -5928,6 +6094,12 @@ def _run_error_hint(
         if isinstance(turns, int) and not isinstance(turns, bool) and turns > 0:
             return None
     return hint
+
+
+# #1072: how long an ``abs_cap`` closing notice (between turns) waits for the
+# finishing turn's final to be handed to the transport.
+_CLOSING_NOTICE_FINAL_WAIT_S = 10.0
+_CLOSING_NOTICE_POLL_S = 0.05
 
 
 def _live_closing_notice(
@@ -6507,14 +6679,64 @@ _SESSION_CLEARED_NOTICE = (
     " be resumed, so it was cleared \N{EM DASH} your next message starts a new"
     " session."
 )
+# #1070: the hint for a failed resume of a session that isn't the chat's
+# saved one (a stale resume line — #1052 keeps the saved session). Replaces
+# the generic "could not be loaded … Send /new" advice, which would throw a
+# healthy saved session away.
+_STALE_RESUME_HINT = (
+    "The session that resume line names couldn't be loaded \N{EM DASH} it may"
+    " have been archived or expired. This chat's saved session isn't affected:"
+    " send your next message without the resume line to carry on."
+)
 # #1047: pre-spawn refusals (``usage[PRESPAWN_BLOCKED_KEY]``) that are
 # answered with their own text alone, in place of the progress card: no
 # error header, code block or footers, and ``session.summary.no_events`` at
 # INFO, since nothing was meant to start. Antigravity's ``/continue`` with no
 # conversation of this project's own to resume (#1039) is an answer, not a
-# failure. The other pre-spawn refusals (RAM, concurrency, OpenCode 2.x,
-# Antigravity's other blocks) still render as an error card.
-_PLAIN_PRESPAWN_BLOCKS = frozenset({"continue_unresolved"})
+# failure; so is an Antigravity "Ask me" run refused because Telegram
+# approvals aren't ready for the project (#980: the text says what to do).
+# The other pre-spawn refusals (RAM, concurrency, OpenCode 2.x, Antigravity's
+# other blocks) still render as an error card.
+_PLAIN_PRESPAWN_BLOCKS = frozenset(
+    {
+        "continue_unresolved",
+        "gate_missing",
+        "gate_not_ready",
+        "gate_foreign_config",
+        "gate_self_protect",
+    }
+)
+
+
+# #1082: pre-spawn refusals whose ``session.summary.no_events`` is INFO — the
+# plain ones above, plus a refused invalid session or model id
+# (``invalid_argument``), which still renders as an error card.
+_INFO_PRESPAWN_BLOCKS = _PLAIN_PRESPAWN_BLOCKS | {engine_argv.INVALID_ARGUMENT_BLOCK}
+
+
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _code_span_entities(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """#1080: a plain refusal's `command` spans become code entities (no
+    literal backticks); every other character is sent verbatim."""
+    parts: list[str] = []
+    entities: list[dict[str, Any]] = []
+    pos = offset = 0
+    for match in _CODE_SPAN_RE.finditer(text):
+        before = text[pos : match.start()]
+        code = match.group(1)
+        parts += [before, code]
+        offset += _utf16_len(before)
+        entities.append({"type": "code", "offset": offset, "length": _utf16_len(code)})
+        offset += _utf16_len(code)
+        pos = match.end()
+    parts.append(text[pos:])
+    return "".join(parts), entities
 
 
 def _plain_prespawn_refusal(usage: dict[str, Any] | None) -> str | None:
@@ -6547,7 +6769,7 @@ async def handle_message(
     running_tasks: RunningTasks | None = None,
     on_thread_known: Callable[[ResumeToken, anyio.Event], Awaitable[None]]
     | None = None,
-    on_resume_failed: Callable[[ResumeToken], Awaitable[None]] | None = None,
+    on_resume_failed: Callable[[ResumeToken], Awaitable[bool | None]] | None = None,
     progress_ref: MessageRef | None = None,
     clock: Callable[[], float] = time.monotonic,
     quarantine_store: QuarantineStore | None = None,
@@ -6838,17 +7060,42 @@ async def handle_message(
         channel_id=incoming.channel_id,
         message_id=incoming.message_id,
     )
-    progress_state = await send_initial_progress(
-        cfg,
-        channel_id=incoming.channel_id,
-        reply_to=user_ref,
-        label="starting",
-        tracker=progress_tracker,
-        progress_ref=progress_ref,
-        resume_formatter=runner.format_resume,
-        context_line=context_line,
-        thread_id=incoming.thread_id,
-    )
+    # #1082: the run is visible to /cancel and /new from here, not only once
+    # its progress message exists — that send can wait seconds behind
+    # group-chat pacing, and a /cancel then answered "nothing running" while
+    # the run went ahead. Until then it is keyed by the queued placeholder
+    # (the card the user sees) or, for a fresh run, the user's own message.
+    running_task: RunningTask | None = None
+    starting_ref: MessageRef | None = None
+    if running_tasks is not None:
+        running_task = RunningTask(context=context, thread_id=incoming.thread_id)
+        starting_ref = progress_ref or MessageRef(
+            channel_id=incoming.channel_id,
+            message_id=incoming.message_id,
+            thread_id=incoming.thread_id,
+        )
+        running_tasks[starting_ref] = running_task
+    sent = False
+    try:
+        progress_state = await send_initial_progress(
+            cfg,
+            channel_id=incoming.channel_id,
+            reply_to=user_ref,
+            label="starting",
+            tracker=progress_tracker,
+            progress_ref=progress_ref,
+            resume_formatter=runner.format_resume,
+            context_line=context_line,
+            thread_id=incoming.thread_id,
+        )
+        sent = True
+    finally:
+        if running_task is not None and running_tasks is not None:
+            if running_tasks.get(starting_ref) is running_task:
+                running_tasks.pop(starting_ref, None)
+            if not sent:
+                # Anyone waiting on this run (a reply routed to it) moves on.
+                running_task.done.set()
     progress_ref = progress_state.ref
 
     edits = ProgressEdits(
@@ -6869,6 +7116,16 @@ async def handle_message(
         # fails.
         min_render_interval=progress_cfg.min_render_interval,
     )
+    if running_task is not None and running_tasks is not None:
+        # #1082: from the start-up key to the run's progress message.
+        if progress_ref is not None:
+            running_task.edits = edits
+            running_tasks[progress_ref] = running_task
+        elif not running_task.cancel_requested.is_set():
+            # No progress message: untracked, as before. A cancel asked for
+            # during start-up is still honoured (the runner never starts).
+            running_task.done.set()
+            running_task = None
 
     # Apply watchdog settings to runner and edits
     edits.run_level = True
@@ -6941,7 +7198,10 @@ async def handle_message(
     if progress_cfg.show_background_tasks:
         _bg_max_rows = progress_cfg.background_tasks_max_rows
         edits.background_provider = lambda: render_background_block(
-            _bg_tasks(), now=time.monotonic(), max_rows=_bg_max_rows
+            _bg_tasks(),
+            now=time.monotonic(),
+            max_rows=_bg_max_rows,
+            note=_engine_note(edits.stream, "background_hold_note"),
         )
     _bg_count_token = register_live_count_source(
         incoming.channel_id, lambda: len(live_shown(_bg_tasks()))
@@ -7162,6 +7422,7 @@ async def handle_message(
         # engine, so the saved session is fine — keep it.
         _blocked = prespawn_blocked_reason(completed.usage)
         _session_auto_cleared = False
+        _stale_resume_kept = False
         if (
             turn is None
             and run_ok is False
@@ -7202,13 +7463,26 @@ async def handle_message(
                 resume_token.engine, completed.usage, run_error
             ):
                 try:
-                    await on_resume_failed(resume_token)
-                    logger.info(
-                        "session.auto_cleared",
-                        engine=resume_token.engine,
-                        resume=resume_token.value,
-                    )
-                    _session_auto_cleared = True
+                    # #1052: the callback says whether it removed anything
+                    # (``None`` = a caller that doesn't report; assume it
+                    # did). A stale resume line for another session leaves
+                    # the chat's saved session alone, so no notice either.
+                    cleared = await on_resume_failed(resume_token)
+                    if cleared is False:
+                        _stale_resume_kept = True
+                        logger.info(
+                            "session.auto_clear_skipped",
+                            reason="not_saved_session",
+                            engine=resume_token.engine,
+                            resume=resume_token.value,
+                        )
+                    else:
+                        logger.info(
+                            "session.auto_cleared",
+                            engine=resume_token.engine,
+                            resume=resume_token.value,
+                        )
+                        _session_auto_cleared = True
                 except Exception:  # noqa: BLE001
                     logger.debug("session.auto_clear_failed", exc_info=True)
             else:
@@ -7234,14 +7508,18 @@ async def handle_message(
             raw_error = str(run_error)
             # #887: the hint depends on why the session ended and on whether
             # the run had any turns, not just on the error text.
-            hint = _run_error_hint(
-                raw_error,
-                usage=completed.usage,
-                close_reason=getattr(
-                    getattr(edits.stream, "engine_state", None),
-                    "live_close_reason",
-                    None,
-                ),
+            hint = (
+                _STALE_RESUME_HINT
+                if _stale_resume_kept
+                else _run_error_hint(
+                    raw_error,
+                    usage=completed.usage,
+                    close_reason=getattr(
+                        getattr(edits.stream, "engine_state", None),
+                        "live_close_reason",
+                        None,
+                    ),
+                )
             )
             if final_answer.strip():
                 # Deduplicate: if the answer already starts with the error's
@@ -7448,6 +7726,11 @@ async def handle_message(
         resume_value = acct.resume_value
         run_usage = acct.run_usage
         sync_resume_token(t_tracker, final_resume)
+        if _stale_resume_kept:
+            # #1070: the footer must not offer the session that just failed
+            # to load — replying to it would fail again. With no resume line
+            # a reply carries on in the chat's saved session.
+            t_tracker.resume = None
 
         # Post-outline guidance: if the session was outline-pending (user
         # clicked "Pause & Outline Plan" but Claude Code ended the run
@@ -7568,9 +7851,11 @@ async def handle_message(
         if plain_refusal:
             # #1047: the refusal's own text replaces the card — no header,
             # resume line or footers (nothing ran), and no Cancel button.
-            final_rendered = RenderedMessage(
-                text=final_answer, extra={"reply_markup": {"inline_keyboard": []}}
-            )
+            refusal_text, refusal_entities = _code_span_entities(final_answer)
+            refusal_extra: dict[str, Any] = {"reply_markup": {"inline_keyboard": []}}
+            if refusal_entities:
+                refusal_extra["entities"] = refusal_entities
+            final_rendered = RenderedMessage(text=refusal_text, extra=refusal_extra)
         else:
             # Append the engine's subscription-usage footer (Claude, Antigravity)
             final_rendered = await _append_subscription_footer(
@@ -7639,6 +7924,10 @@ async def handle_message(
             _promote_quiet_breakout(turn)
             t_notify = turn.notify  # a quiet batch's breakout always pushes
 
+        # #981: an engine's decision card (Antigravity Plan first) goes out
+        # as the final's last message — after every footer above.
+        final_rendered = _append_review_card(final_rendered, completed.usage)
+
         can_edit_final = t_progress_ref is not None
         edit_ref = None if t_notify or not can_edit_final else t_progress_ref
 
@@ -7672,6 +7961,7 @@ async def handle_message(
         except Exception:
             delivery["sent"] = False
             raise
+        await _retire_review_cards(cfg.transport, completed.usage)
         if (
             capped_head is not None
             and final_ref is not None
@@ -7690,13 +7980,6 @@ async def handle_message(
         # Must happen AFTER send_result_message() so a crash between
         # delete_ephemeral() and here still has an orphan cleanup pointer.
         _release_progress(t_progress_ref, reason="final")
-
-    running_task: RunningTask | None = None
-    if running_tasks is not None and progress_ref is not None:
-        running_task = RunningTask(
-            context=context, edits=edits, thread_id=incoming.thread_id
-        )
-        running_tasks[progress_ref] = running_task
 
     # ── #776 live-session follow-up turns ─────────────────────────────────
     outbox_early = {"delivered": False}
@@ -7828,6 +8111,23 @@ async def handle_message(
         except Exception:  # noqa: BLE001
             logger.warning("live_session.notice_failed", exc_info=True)
 
+    async def _await_final_handed_off() -> None:
+        """#1072: a session closed at its time limit right after a turn
+        ended announces it only after that turn's final is handed to the
+        transport — the close follows the result within a poll, while the
+        final is still being rendered. Bounded; a final that never comes
+        (held for a recovery) just lets the notice through."""
+        # Polled: the hand-off is two flags set on different paths (the
+        # first turn's early final, a follow-up turn's router delivery).
+        for _ in range(int(_CLOSING_NOTICE_FINAL_WAIT_S / _CLOSING_NOTICE_POLL_S)):
+            if final_delivery["sent"] and turn_router.current is None:
+                return
+            await anyio.sleep(_CLOSING_NOTICE_POLL_S)
+        logger.info(
+            "live_session.notice_final_wait_expired",
+            wait_s=_CLOSING_NOTICE_FINAL_WAIT_S,
+        )
+
     async def _on_live_notice(kind: str, payload: dict[str, Any]) -> None:
         if not live_notices["all"] and payload.get("reason") != "abs_cap":
             return  # #887: before the first result only the time limit speaks
@@ -7911,6 +8211,8 @@ async def handle_message(
         )
         if tasks or cap_mid_turn:
             closing_named_tasks["reason"] = str(payload.get("reason"))
+        if payload.get("reason") == "abs_cap" and not cap_mid_turn:
+            await _await_final_handed_off()
         try:
             await cfg.transport.send(
                 channel_id=incoming.channel_id,
@@ -8234,8 +8536,12 @@ async def handle_message(
                         )
             except Exception:  # noqa: BLE001
                 logger.debug("live_followup.unrun_notice_failed", exc_info=True)
+            # #1083: an Antigravity steer that never ran logs under its own
+            # engine's name; Claude's event name is unchanged.
             logger.warning(
-                "claude.live_session.followup_not_run",
+                "claude.live_session.followup_not_run"
+                if runner.engine == "claude"
+                else f"{runner.engine}.steer.not_run",
                 session_id=sid.value,
                 user_msg_id=reply_to.message_id,
             )
@@ -8574,8 +8880,13 @@ async def handle_message(
         if error is not None:
             release_reason = "error"
             sync_resume_token(progress_tracker, outcome.resume)
-            err_body = _format_error(error)
-            hint = _get_error_hint(err_body)
+            raw_err = _format_error(error)
+            hint = _get_error_hint(raw_err)
+            # #1065: a runner exception can quote a user-typed value (the
+            # "emitted session id … but expected …" check) or a path, so the
+            # card gets the shared stderr sanitiser (#1033: URLs incl. their
+            # query string, then absolute paths). The log keeps the raw text.
+            err_body = _sanitise_stderr(raw_err)
             if hint:
                 err_body = f"\N{ELECTRIC LIGHT BULB} {hint}\n\n```\n{err_body}\n```"
             else:
@@ -8629,7 +8940,14 @@ async def handle_message(
 
         if outcome.cancelled:
             release_reason = "cancelled"
-            resume = sync_resume_token(progress_tracker, outcome.resume)
+            # #1084: a resumed run cancelled after it started but before any
+            # event never saw its StartedEvent; the card still names the
+            # session it was resuming. A /continue token names none (its
+            # empty value would render a bare "resume" line), so it is skipped.
+            resume = sync_resume_token(
+                progress_tracker,
+                _session_token(outcome.resume) or _session_token(resume_token),
+            )
             logger.info(
                 "handle.cancelled",
                 resume=resume.value if resume else None,
@@ -8640,6 +8958,11 @@ async def handle_message(
                 context_line=context_line,
                 meta_formatter=format_meta_line,
             )
+            # #1061: an engine holding its answer for background work
+            # (Antigravity) says where the answer went.
+            if (hold := _engine_note(edits.stream, "cancelled_hold_note")) is not None:
+                state = dataclasses.replace(state, background=escape_markdown(hold))
+                logger.info("handle.cancelled_during_hold")
             final_rendered = effective_presenter.render_progress(
                 state,
                 elapsed_s=elapsed,

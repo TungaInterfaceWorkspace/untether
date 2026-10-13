@@ -214,7 +214,7 @@ The chat is in **Workspace** mode, which has no shell, web or MCP tools: the com
 **Symptoms:** a `⚠️ Blocked: …` row, and the reply ends with "headless runs can't ask for approval, so it stopped there. To allow it: /config → Permission mode → Full access, then /new."
 
 - **A file outside the project.** Workspace only reaches the project. Switch to **Full access** in `/config` → **Permission mode**, then send `/new`.
-- **A shell command** (`⚠️ Blocked: shell command (RunCommand) — …`). Workspace conversations normally have no shell tool at all, so this means the conversation isn't on Untether's no-shell agent: it started in Full access, or the [agent file is unavailable](#antigravity-workspace-agent-file-unavailable). Send `/new` to get a clean Workspace conversation, or switch to Full access and send `/new`. In these conversations an exact allow rule such as `command(git status)` in `permissions.allow` in agy's settings file also lets that one command through.
+- **A shell command** (`⚠️ Blocked: shell command (RunCommand) — …`). Workspace conversations normally have no shell tool at all, so this means the conversation isn't on Untether's no-shell agent: it started in Full access, or the [agent file is unavailable](#antigravity-workspace-agent-file-unavailable). Send `/new` to get a clean Workspace conversation, or switch to Full access and send `/new`. When the conversation started in Full access, the notice itself says so and asks for `/new`. In these conversations an exact allow rule such as `command(git status)` in `permissions.allow` in agy's settings file also lets that one command through.
 
 For a cron, set `permission_mode = "full"` on the cron itself; webhook runs never get Full access. See [Permission mode](interactive-approval.md#antigravity-cli-permission-mode).
 
@@ -226,9 +226,23 @@ Untether couldn't write its no-shell agent file, `~/.gemini/config/agents/unteth
 
 With `reason=project_agents`, the project defines its own agy agents or plugins (an `agents`, `agents.json`, `plugins` or `plugins.json` entry in one of its `.agents/` folders). agy picks agents by name, so Untether won't name its own agent in such a project, and Workspace runs there use agy's default agent: a shell attempt ends the turn with the blocked notice, as it did before the no-shell agent. `reason=project_unchecked` means the project's `.agents` is a symlink or couldn't be listed. `reason=user_agent` or `user_unchecked` means your own `~/.gemini/config/agents/` has a second `untether-workspace`, or something other than `agent.md` sits in Untether's folder there: remove it.
 
-### "Ask me needs Untether's approval gate"
+### Antigravity Ask me is refused
 
-Ask me and Plan first aren't available yet. Pick Workspace or Full access in `/config` → **Permission mode** (or change `[antigravity] permission_mode`).
+Ask me needs [Untether's agy plugin](antigravity.md#telegram-questions-and-steer) on the host and checks it before every run; nothing runs when a check fails, and the reply says which:
+
+- **"aren't set up on this host"**: run `untether agy-gate install` on the host.
+- **"aren't ready for this project"**: run `untether agy-gate status --project <folder>`. Common causes: `agy plugin disable untether-gate` was run (`agy plugin enable untether-gate`), the plugin is from another Untether version (`untether agy-gate install`), or agy isn't signed in.
+- **"isn't available in this project"**: the project contains Untether's own code (the dev bot's own checkout, for example), or agy loads hooks, plugins, agents or MCP servers there that Untether doesn't manage. Those run their own commands without asking, so Ask me would promise something it can't keep. Use Workspace or Full access there, or remove that config.
+
+Cron and webhook runs only use Ask me when the cron itself sets `permission_mode = "ask"`; a chat's Ask me runs them as Workspace.
+
+### Antigravity Ask me: no card for a shell command
+
+If you switched a chat from Workspace or Plan first to Ask me, the conversation still runs on Untether's no-shell agent, so agy has no shell to ask about. Send `/new`. Switching between Ask me and Full access needs no `/new`.
+
+### Antigravity Plan first: "This plan card has expired" or "A newer plan replaced this one"
+
+Plan cards live in Untether's memory for 24 hours and only the newest card for a conversation can be approved. After a restart, or once you have sent another message (which plans again), older cards no longer work. Send a message to get a fresh plan and use its card. If Antigravity answers without writing a plan, the answer ends with "no plan was written this time"; reply to keep planning.
 
 ### "That Antigravity conversation no longer exists"
 
@@ -267,6 +281,8 @@ agy sends one answer per run and holds it until background commands it started h
 **Symptoms:** a cron or webhook run replies `agy's workspace config changed since someone last ran Antigravity in this chat's project (…)`, or `Untether couldn't check agy's hooks, plugins and MCP servers …`.
 
 agy runs its own hooks, plugins and MCP servers in every mode, so Untether won't let an unattended run execute config nobody has seen. The message names the files: check them on the host first if you didn't change them, because the next message sent in that chat runs with the changed config. That run shows a ⚠️ row listing the files, and the schedule works again from the next fire. An `/at` or `/loop` run doesn't release the hold. If the check itself can't finish, the message says why (for example too many files under `.agents/`, a config file that isn't plain JSON, an agent file whose front matter Untether can't read with certainty, or a hook command that is itself a variable). Scheduled runs then stay held until a check succeeds; a message sent in the chat still runs and shows a ⚠️ row, but doesn't release them. After upgrading to v0.36.1 you may see the "config changed" message once for a project whose agy config Untether now follows more fully; see [Upgrading to v0.36.1](update.md#upgrading-to-v0361).
+
+If the message instead starts `Untether's agy plugin (untether-gate) isn't what Untether installed`, the change is to Untether's own agy plugin, whose hooks run in every agy session on the host. A message in the chat doesn't release this hold: every scheduled Antigravity run stays held until the plugin is restored. Check what changed in `~/.gemini/config/plugins/untether-gate/` if you didn't change it, then run the command the message names on the host (`untether agy-gate install --force`, or `untether agy-gate install` when only the version differs) ([#1078](https://github.com/littlebearapps/untether/issues/1078)).
 
 ### A scheduled Antigravity run says it couldn't read agy's tool-permission setting
 
@@ -584,7 +600,7 @@ Since v0.36.0 `/browse` only works in a chat bound to a project (`chat_id` under
 
 - **Chat mode** (`session_mode = "chat"`): Just send another message — it auto-resumes. Use `/new` to start fresh.
 - **Stateless mode** (`session_mode = "stateless"`): You must **reply** to a message that contains a resume token. Plain messages start new sessions.
-- If a resumed run fails and its error card ends with `ℹ️ The saved session couldn't be resumed, so it was cleared — your next message starts a new session.`, the saved session couldn't be found (Codex `no rollout found`, OpenCode `Session not found`, Pi `No session found`) or, for Claude, the run ended with no turns. Just send your message again. For Codex, OpenCode and Pi, a resumed run that fails for an unrelated reason (a bad `/model`, a missing API key) keeps the saved session, so fix the cause and carry on in the same conversation ([#952](https://github.com/littlebearapps/untether/issues/952)).
+- If a resumed run fails and its error card ends with `ℹ️ The saved session couldn't be resumed, so it was cleared — your next message starts a new session.`, the saved session couldn't be found (Codex `no rollout found`, OpenCode `Session not found`, Pi `No session found`) or, for Claude, the run ended with no turns. Just send your message again. For Codex, OpenCode and Pi, a resumed run that fails for an unrelated reason (a bad `/model`, a missing API key) keeps the saved session, so fix the cause and carry on in the same conversation ([#952](https://github.com/littlebearapps/untether/issues/952)). A resume line that names some other session (an old one you replied to) never clears the chat's saved session: that run just fails, and your next plain message carries on in the saved session ([#1052](https://github.com/littlebearapps/untether/issues/1052)). Its error card says `This chat's saved session isn't affected` and has no resume line of its own, so replying to it carries on too ([#1070](https://github.com/littlebearapps/untether/issues/1070)).
 - If resume fails silently, the previous session may be **poisoned** by an upstream turn-state bug (a resume that returns 0 turns / an empty answer). Untether detects this, quarantines that session so it is never resumed again, and automatically re-sends your message on a **fresh** session — you'll see a short notice that it did so ([#631](https://github.com/littlebearapps/untether/issues/631), [#632](https://github.com/littlebearapps/untether/issues/632)). A session force-killed after delivering its result is quarantined proactively, so your *next* message diverts fresh before any empty result appears. Since v0.36.0 sessions normally close gracefully, so this fresh-session divert is rare, and an idle session that is merely slow to exit is no longer quarantined ([#791](https://github.com/littlebearapps/untether/issues/791)).
 
 ## Follow-up message says it's "queued"

@@ -13,7 +13,7 @@ from ..context import RunContext
 from ..logging import get_logger
 from ..markdown import MarkdownFormatter, MarkdownParts
 from ..model import ResumeToken
-from ..progress import ProgressState
+from ..progress import ProgressState, keyboard_action
 from ..runner_bridge import ExecBridgeConfig, RunningTask, RunningTasks
 from ..scheduler import ThreadScheduler
 from ..settings import (
@@ -115,34 +115,29 @@ class TelegramPresenter:
         if _is_cancelled_label(label):
             reply_markup = CLEAR_MARKUP
         else:
-            # Check if any active action has inline keyboard buttons (e.g. permission approval)
-            #
-            # #683: scan NEWEST-first. Telegram renders one keyboard per
-            # message, and the newest pending request is the one the user must
-            # answer. Oldest-first let an uncompleted keyboard action — most
-            # notably the synthetic ``claude.discuss_approve.N`` emitted by the
-            # Pause & Outline hold-open path, which nothing ever completes —
-            # pin the keyboard for the rest of the run and silently swallow
-            # every later AskUserQuestion / approval keyboard.
+            # A pending action's inline keyboard (e.g. permission approval).
+            # Telegram renders one keyboard per message: #1079 keeps it on
+            # the oldest pending request until that is answered
+            # (``progress.keyboard_action``; a Pause & Outline hold ranks
+            # last, #683).
             reply_markup = CANCEL_MARKUP
-            for action_state in reversed(state.actions):
-                if not action_state.completed:
-                    kb = action_state.action.detail.get("inline_keyboard")
-                    if kb and isinstance(kb, dict) and "buttons" in kb:
-                        # Merge permission buttons with cancel button
-                        reply_markup = {
-                            "inline_keyboard": kb["buttons"]
-                            + CANCEL_MARKUP["inline_keyboard"]
-                        }
-                        logger.info(
-                            "render_progress.inline_keyboard_found",
-                            action_id=action_state.action.id,
-                            buttons=len(kb["buttons"]),
-                            # #822: which request / tool the keyboard is for.
-                            request_id=action_state.action.detail.get("request_id"),
-                            tool_name=action_state.action.detail.get("tool_name"),
-                        )
-                        break
+            action_state = keyboard_action(state.actions)
+            if action_state is not None:
+                kb = action_state.action.detail.get("inline_keyboard")
+                if kb and isinstance(kb, dict) and "buttons" in kb:
+                    # Merge permission buttons with cancel button
+                    reply_markup = {
+                        "inline_keyboard": kb["buttons"]
+                        + CANCEL_MARKUP["inline_keyboard"]
+                    }
+                    logger.info(
+                        "render_progress.inline_keyboard_found",
+                        action_id=action_state.action.id,
+                        buttons=len(kb["buttons"]),
+                        # #822: which request / tool the keyboard is for.
+                        request_id=action_state.action.detail.get("request_id"),
+                        tool_name=action_state.action.detail.get("tool_name"),
+                    )
         return RenderedMessage(
             text=text,
             extra={"entities": entities, "reply_markup": reply_markup},
@@ -400,7 +395,10 @@ class TelegramTransport:
         }
         for index, followup in enumerate(followups):
             try:
-                await self._bot.send_message(**self._followup_params(followup, **route))
+                sent = await self._bot.send_message(
+                    **self._followup_params(followup, **route)
+                )
+                self._note_followup_sent(followup, chat_id, sent, message_thread_id)
             except anyio.get_cancelled_exc_class():
                 # #928: a bounded caller (the early final delivery) cut the
                 # send short. This chunk is already queued; queue the rest
@@ -414,6 +412,31 @@ class TelegramTransport:
                     error=str(exc),
                     error_type=exc.__class__.__name__,
                 )
+
+    @staticmethod
+    def _note_followup_sent(
+        followup: RenderedMessage,
+        chat_id: int,
+        sent: Any,
+        thread_id: int | None,
+    ) -> None:
+        """#1074: a chunk may ask where it landed (``extra["on_sent"]``, called
+        with its ``MessageRef``), e.g. a review card a later run retires."""
+        hook = followup.extra.get("on_sent")
+        message_id = getattr(sent, "message_id", None)
+        if not callable(hook) or not isinstance(message_id, int):
+            return
+        sent_thread = getattr(sent, "message_thread_id", None)
+        try:
+            hook(
+                MessageRef(
+                    channel_id=chat_id,
+                    message_id=message_id,
+                    thread_id=sent_thread if sent_thread is not None else thread_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 — bookkeeping never fails a send
+            logger.debug("transport.followup.on_sent_failed", exc_info=True)
 
     async def _queue_followups(
         self,
@@ -725,10 +748,14 @@ async def handle_cancel(
     msg: TelegramIncomingMessage,
     running_tasks: RunningTasks,
     scheduler: ThreadScheduler | None = None,
+    *,
+    dropped_pending: bool = False,
 ) -> None:
     from .commands import handle_cancel as _handle_cancel
 
-    await _handle_cancel(cfg, msg, running_tasks, scheduler)
+    await _handle_cancel(
+        cfg, msg, running_tasks, scheduler, dropped_pending=dropped_pending
+    )
 
 
 async def handle_callback_cancel(

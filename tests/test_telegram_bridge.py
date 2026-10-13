@@ -251,28 +251,38 @@ def test_telegram_presenter_progress_shows_cancel_button() -> None:
 
 
 def _keyboard_action(
-    action_id: str, buttons: list[list[dict[str, str]]]
+    action_id: str,
+    buttons: list[list[dict[str, str]]],
+    *,
+    request_type: str | None = None,
 ) -> ActionEvent:
     """Build a started `warning` action carrying an inline keyboard."""
+    detail: dict[str, object] = {"inline_keyboard": {"buttons": buttons}}
+    if request_type is not None:
+        detail["request_type"] = request_type
     return ActionEvent(
         engine="claude",
         action=Action(
             id=action_id,
             kind="warning",
             title=action_id,
-            detail={"inline_keyboard": {"buttons": buttons}},
+            detail=detail,
         ),
         phase="started",
     )
 
 
-def test_telegram_presenter_progress_prefers_newest_pending_keyboard() -> None:
+def test_telegram_presenter_progress_outline_hold_never_shadows_a_later_keyboard() -> (
+    None
+):
     """A stale uncompleted keyboard action must not shadow a newer one (#683).
 
     The synthetic ``claude.discuss_approve.N`` action emitted by the
-    Pause & Outline hold-open path is never completed, so an oldest-first
-    scan pinned the rendered keyboard to it for the rest of the run and
-    silently swallowed every later AskUserQuestion / approval keyboard.
+    Pause & Outline hold-open path (``request_type=DiscussApproval``) was
+    never completed, so an oldest-first scan pinned the rendered keyboard to
+    it for the rest of the run and silently swallowed every later
+    AskUserQuestion / approval keyboard. #1079 is oldest-first again, with
+    such a hold ranked after every other request.
     """
     presenter = TelegramPresenter()
     tracker = ProgressTracker(engine="claude")
@@ -287,6 +297,7 @@ def test_telegram_presenter_progress_prefers_newest_pending_keyboard() -> None:
                     }
                 ]
             ],
+            request_type="DiscussApproval",
         )
     )
     tracker.note_event(
@@ -305,6 +316,41 @@ def test_telegram_presenter_progress_prefers_newest_pending_keyboard() -> None:
     assert keyboard[0][0]["callback_data"] == "aq:opt:0"
     assert keyboard[1][0]["callback_data"] == "aq:other"
     assert keyboard[-1][0]["text"] == "cancel"
+
+
+def test_telegram_presenter_progress_keeps_the_oldest_pending_keyboard() -> None:
+    """#1079: with two requests pending, the buttons stay on the first one
+    until it is answered; a newer request doesn't take them over under the
+    user's finger. Then they move to the next one."""
+    presenter = TelegramPresenter()
+    tracker = ProgressTracker(engine="antigravity")
+    tracker.note_event(
+        _keyboard_action(
+            "gate.agy_967f",
+            [[{"text": "✅ Approve", "callback_data": "ia:approve:agy_967f"}]],
+        )
+    )
+    tracker.note_event(
+        _keyboard_action(
+            "gate.agy_e6f1",
+            [[{"text": "✅ Approve", "callback_data": "ia:approve:agy_e6f1"}]],
+        )
+    )
+    rendered = presenter.render_progress(tracker.snapshot(), elapsed_s=0.0)
+    keyboard = rendered.extra["reply_markup"]["inline_keyboard"]
+    assert keyboard[0][0]["callback_data"] == "ia:approve:agy_967f"
+    # The row the buttons answer is marked while more than one waits.
+    assert rendered.text.count("👇") == 1
+    assert "👇 ▸ gate.agy_967f" in rendered.text
+    first = _keyboard_action(
+        "gate.agy_967f",
+        [[{"text": "✅ Approve", "callback_data": "ia:approve:agy_967f"}]],
+    )
+    tracker.note_event(replace(first, phase="completed"))
+    rendered = presenter.render_progress(tracker.snapshot(), elapsed_s=0.0)
+    keyboard = rendered.extra["reply_markup"]["inline_keyboard"]
+    assert keyboard[0][0]["callback_data"] == "ia:approve:agy_e6f1"
+    assert "👇" not in rendered.text  # one request left: unmarked, as before
 
 
 def test_telegram_presenter_progress_skips_completed_keyboard_actions() -> None:
@@ -432,6 +478,31 @@ async def test_telegram_transport_sends_followups() -> None:
     assert bot.send_calls[1]["message_thread_id"] == 7
     assert bot.send_calls[1]["replace_message_id"] is None
     assert bot.send_calls[1]["disable_notification"] is True
+
+
+@pytest.mark.anyio
+async def test_telegram_transport_reports_where_a_followup_landed() -> None:
+    """#1074: a follow-up chunk's ``on_sent`` hook gets its MessageRef (the
+    plan card a later run retires); a failing hook doesn't fail the send."""
+    bot = FakeBot()
+    transport = TelegramTransport(bot)
+    seen: list[MessageRef] = []
+
+    def boom(_ref: MessageRef) -> None:
+        raise RuntimeError("hook")
+
+    card = RenderedMessage(text="card", extra={"on_sent": seen.append})
+    bad = RenderedMessage(text="bad", extra={"on_sent": boom})
+    await transport.send(
+        channel_id=123,
+        message=RenderedMessage(text="final", extra={"followups": [card, bad]}),
+        options=SendOptions(thread_id=7),
+    )
+    assert len(bot.send_calls) == 3
+    (ref,) = seen
+    assert ref.channel_id == 123 and ref.thread_id == 7
+    assert isinstance(ref.message_id, int)
+    assert "on_sent" not in bot.send_calls[1]
 
 
 @pytest.mark.anyio
@@ -4475,6 +4546,93 @@ async def test_807_command_barrier_real_window(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_1084_cancel_in_window_replies_once() -> None:
+    """#1084: `A, /cancel` inside one coalesce window answered twice — the
+    🗑️ notice and "nothing running in this chat." The notice is the reply."""
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    runtime = TransportRuntime(router=_make_router(runner), projects=_empty_projects())
+    cfg = _coalesce_cfg(runtime)
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield _user_msg(1, "alpha prompt")
+        await anyio.sleep(_cfg.forward_coalesce_s / 4)
+        yield _user_msg(2, "/cancel")
+        await anyio.sleep(_cfg.forward_coalesce_s * 4)
+
+    with anyio.fail_after(30):
+        await run_main_loop(cfg, poller)
+
+    assert runner.calls == []
+    texts = [call["message"].text for call in transport.send_calls]
+    assert texts == [
+        "🗑️ Dropped 1 message sent just before /cancel — "
+        "send it again if you still need it."
+    ]
+
+
+@pytest.mark.anyio
+async def test_1084_cancel_outside_window_still_says_nothing_running() -> None:
+    """#902 still holds: a /cancel with nothing pending always replies."""
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    runtime = TransportRuntime(router=_make_router(runner), projects=_empty_projects())
+    cfg = _coalesce_cfg(runtime)
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield _user_msg(2, "/cancel")
+        await anyio.sleep(_cfg.forward_coalesce_s * 2)
+
+    with anyio.fail_after(30):
+        await run_main_loop(cfg, poller)
+
+    texts = [call["message"].text for call in transport.send_calls]
+    assert texts == ["nothing running in this chat."]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("reply_to_message_id", "reply_to_text"),
+    [(None, None), (None, "an old message"), (77, "an old message")],
+)
+async def test_1084_dropped_pending_skips_only_nothing_running(
+    reply_to_message_id: int | None, reply_to_text: str | None
+) -> None:
+    """Every "nothing running" variant is skipped when the barrier's notice
+    already answered; an idle-session close is still reported (#902)."""
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/cancel",
+        reply_to_message_id=reply_to_message_id,
+        reply_to_text=reply_to_text,
+        sender_id=123,
+    )
+    await handle_cancel(cfg, msg, {}, dropped_pending=True)
+    assert transport.send_calls == []
+
+
+@pytest.mark.anyio
+async def test_1084_dropped_pending_still_reports_idle_close() -> None:
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+    idle = _idle_live_task()
+    await handle_cancel(
+        cfg,
+        _plain_cancel_msg(),
+        {MessageRef(channel_id=123, message_id=4084): idle},
+        dropped_pending=True,
+    )
+    assert idle.cancel_requested.is_set()
+    assert transport.send_calls[-1]["message"].text == (
+        "nothing running in this chat \N{EM DASH} closed the idle session."
+    )
+
+
+@pytest.mark.anyio
 async def test_run_main_loop_ignores_forwarded_without_prompt() -> None:
     runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
     runtime = TransportRuntime(router=_make_router(runner), projects=_empty_projects())
@@ -5530,7 +5688,7 @@ async def test_388_typed_ask_answer_originator_only(
         calls.append((request_id, text))
         return True
 
-    monkeypatch.setattr(claude_mod, "answer_ask_question", _answer)
+    monkeypatch.setattr("untether.interactive.questions.answer_ask_question", _answer)
     claude_mod._PENDING_ASK_REQUESTS["req-388a"] = (123, "Which one?")
     claude_mod._REQUEST_TO_SESSION["req-388a"] = "sess-388a"
     claude_mod._REQUEST_TO_ORIGINATOR["req-388a"] = 2

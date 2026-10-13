@@ -42,9 +42,11 @@ def test_agent_flag_allows_only_untethers_agent() -> None:
             agy_flag("--agent", bad)
 
 
-def test_agent_file_lists_file_tools_only() -> None:
+def test_agent_file_lists_file_tools_and_ask_only() -> None:
     head = agent.AGENT_MD.split("---")[1]
     tools = [line.strip()[2:] for line in head.splitlines() if line.startswith("  - ")]
+    # #980 (R3-2): ask_question joins the file tools — an unanswered question
+    # is skipped and the turn goes on. Still no shell, web, MCP or subagent.
     assert tools == [
         "view_file",
         "list_dir",
@@ -53,16 +55,148 @@ def test_agent_file_lists_file_tools_only() -> None:
         "write_to_file",
         "replace_file_content",
         "multi_replace_file_content",
+        "ask_question",
     ]
+    assert not {"run_command", "invoke_subagent", "call_mcp_tool"} & set(tools)
+    assert "ask_question" in agent.AGENT_MD.split("---", 2)[2]
     assert "name: untether-workspace\n" in head
     # The user is told that Full access needs a new conversation.
     assert "/new" in agent.AGENT_MD and "Full access" in agent.AGENT_MD
 
 
+# The rc3 text (#1037), as installed on hosts before #1055.
+_RC3_ADVICE = (
+    "Tell the user that this needs Full access: /config, then Permission mode, "
+    "then Full access, and then /new, because a conversation that started in "
+    "Workspace mode stays in it."
+)
+
+
+def test_agent_advice_covers_cron_and_webhook_runs() -> None:
+    """#1055: a cron or webhook run never takes Full access from the chat,
+    so chat-only advice sent its reader to the wrong switch."""
+    advice = agent.AGENT_MD.split("# Working without a shell", 1)[1]
+    assert _RC3_ADVICE not in advice
+    assert "In a chat: /config, then Permission mode, then Full access" in advice
+    assert '`permission_mode = "full"` on the cron itself' in advice
+    assert "a webhook never does" in advice
+    # Still a short agent: four bullets, no essay.
+    assert advice.count("\n- ") == 4 and len(advice) < 1000
+
+
+def _sent_prompt(options: EngineRunOptions | None) -> str:
+    import json
+
+    runner = AntigravityRunner()
+    with apply_run_options(options):
+        state = runner.new_state("run ls -la", None)
+        runner.build_args("run ls -la", None, state=state)
+        raw = runner.stdin_payload("run ls -la", None, state=state)
+    assert raw is not None
+    return json.loads(raw)["message"]["content"]
+
+
+def test_unattended_workspace_prompt_says_it_is_scheduled() -> None:
+    """#1055 (rc4 QA, 2/2 cron fires): with only the agent file's two routes
+    the model always gave the chat's, as nothing told it the run was a cron.
+    An unattended Workspace run's prompt now starts with a line naming the
+    trigger and its own route; chat, Full access and Plan first runs don't."""
+    with structlog.testing.capture_logs() as logs:
+        cron = _sent_prompt(EngineRunOptions(unattended_trigger="cron:nightly"))
+    assert cron.startswith("[Untether] This is a scheduled cron run, not a chat")
+    assert '`permission_mode = "full"` on its own entry in untether.toml' in cron
+    assert cron.endswith("\n\nrun ls -la")
+    (log,) = [e for e in logs if e["event"] == "antigravity.prompt.scheduled_note"]
+    assert log["trigger"] == "cron:nightly" and log["permission_mode"] == "workspace"
+
+    hook = _sent_prompt(EngineRunOptions(unattended_trigger="webhook:gh"))
+    assert hook.startswith("[Untether] This is a scheduled webhook run")
+    assert "never gets Full access" in hook and "permission_mode" not in hook
+
+    # A cron that inherits the chat's Full access is downgraded: still noted.
+    inherited = _sent_prompt(
+        EngineRunOptions(permission_mode="full", unattended_trigger="cron:x")
+    )
+    assert inherited.startswith("[Untether] This is a scheduled cron run")
+
+    for options in (
+        None,
+        EngineRunOptions(permission_mode="workspace"),
+        EngineRunOptions(
+            permission_mode="full",
+            trigger_permission_mode="full",
+            unattended_trigger="cron:x",
+        ),
+        EngineRunOptions(permission_mode="plan", unattended_trigger="cron:x"),
+    ):
+        assert _sent_prompt(options) == "run ls -la", options
+
+
+def test_unattended_ask_me_prompt_says_nobody_approves() -> None:
+    """#980: a cron whose own permission_mode is ``ask`` is told up front
+    that everything needing a tap is refused; a chat's Ask me on a cron runs
+    as Workspace and gets the Workspace line."""
+    import json
+
+    from untether.antigravity.gate_server import GateRun
+    from untether.events import EventFactory
+    from untether.runners.antigravity import GateFacts, decide_antigravity_mode
+
+    runner = AntigravityRunner()
+    options = EngineRunOptions(
+        permission_mode="ask",
+        trigger_permission_mode="ask",
+        unattended_trigger="cron:nightly",
+    )
+    with apply_run_options(options):
+        state = runner.new_state("run ls -la", None)
+        # What run_impl hands over when the gate is ready.
+        state.decision = decide_antigravity_mode(
+            "ask", GateFacts(installed=True, listening=True)
+        )
+        state.gate = GateRun(
+            config_path=None, factory=EventFactory("antigravity"), required=True
+        )
+        runner.build_args("run ls -la", None, state=state)
+        raw = runner.stdin_payload("run ls -la", None, state=state)
+    assert raw is not None
+    trigger_ask = json.loads(raw)["message"]["content"]
+    assert trigger_ask.startswith("[Untether] This is a scheduled cron run")
+    assert "It runs in Ask me mode" in trigger_ask
+    assert "shell commands, web, MCP tools, subagents" in trigger_ask
+    inherited = _sent_prompt(
+        EngineRunOptions(permission_mode="ask", unattended_trigger="cron:nightly")
+    )
+    assert "It runs in Workspace mode" in inherited
+    assert _sent_prompt(EngineRunOptions(permission_mode="ask")) == "run ls -la"
+
+
+def test_upgrade_rewrites_the_old_agent_without_a_hold(project: Path) -> None:
+    """An rc3 copy on disk is replaced on the next Workspace run, and neither
+    copy is ever in the planted-config digest (#1043's exact-path exemption)."""
+    (project / ".agents").mkdir()
+    (project / ".agents" / "hooks.json").write_text('{"Stop": []}')
+    path = agent.agent_path()
+    path.parent.mkdir(parents=True)
+    old = agent.AGENT_MD.split("# Working without a shell", 1)[0] + (
+        "# Working without a shell\n- " + _RC3_ADVICE + "\n"
+    )
+    path.write_text(old)
+    before = scan.scan_workspace_config(project)
+    assert before.unchecked_reason is None
+    assert _args()[-1] == AGENT_FLAG
+    assert path.read_text() == agent.AGENT_MD
+    after = scan.scan_workspace_config(project)
+    assert after.agy_digest == before.agy_digest
+    assert not any("untether-workspace" in key for key in after.agy)
+
+
 @pytest.mark.parametrize("mode", [None, "workspace", "ask", "plan", "bogus"])
 def test_workspace_runs_name_the_agent(mode: str | None) -> None:
     args = _args(EngineRunOptions(permission_mode=mode))
-    assert args[-2:] == ["--mode=accept-edits", AGENT_FLAG]
+    # #981: Plan first plans under the same no-shell agent.
+    agy_mode = "--mode=plan" if mode == "plan" else "--mode=accept-edits"
+    assert args[-2:] == [agy_mode, AGENT_FLAG]
     assert agy.BYPASS_FLAG not in args
     assert agent.agent_path().read_text() == agent.AGENT_MD
 
@@ -176,6 +310,88 @@ def test_denial_notice_points_at_new_and_keeps_the_rule_hint_for_shell() -> None
     )
     assert "; add an allow rule such as `command(git status)`" in hook_shell
     assert hook_shell.endswith(", or run it from the chat.")
+
+
+def _replay_resumed(name: str, *, agent_flag: bool) -> str:
+    """Replay a resumed Workspace run of fixture *name*; its final answer."""
+    import json as _json
+
+    from untether.model import CompletedEvent, ResumeToken
+    from untether.schemas import antigravity as schema
+
+    fixture = Path(__file__).parent / "fixtures" / "antigravity" / f"{name}.jsonl"
+    lines = [ln for ln in fixture.read_text().splitlines() if ln.strip()]
+    cid = _json.loads(lines[0])["conversation_id"]
+    runner = AntigravityRunner()
+    resume = ResumeToken(engine="antigravity", value=cid)
+    state = runner.new_state("p", resume)
+    runner.build_args("p", resume, state=state)
+    assert (AGENT_FLAG in (state.argv or [])) is True
+    if not agent_flag:
+        state.argv = [a for a in state.argv or [] if a != AGENT_FLAG]
+    events = []
+    for line in lines:
+        events.extend(
+            runner.translate(
+                schema.decode_event(line),
+                state=state,
+                resume=resume,
+                found_session=None,
+            )
+        )
+    (done,) = [e for e in events if isinstance(e, CompletedEvent)]
+    return done.answer
+
+
+def test_resumed_conversation_that_kept_its_shell_says_new() -> None:
+    """#1060 (agy 1.3.3 capture rc4-a3): a conversation started in Full
+    access, resumed in Workspace with ``--agent=untether-workspace``. agy
+    ignores ``--agent`` on a resume, so the model still had ``run_command``,
+    Workspace blocked it and the turn ended there. The notice says /new, not
+    "Full access, then /new"."""
+    answer = _replay_resumed("resume_kept_shell", agent_flag=True)
+    assert "This conversation started without Workspace's no-shell tools" in answer
+    assert "Send /new to start a Workspace conversation" in answer
+    assert "Full access, then /new" not in answer
+
+
+def test_shell_denial_without_the_agent_keeps_the_old_advice() -> None:
+    """No ``--agent`` on the run (the file couldn't be put in place): a
+    shell denial says nothing about the conversation's first agent."""
+    answer = _replay_resumed("resume_kept_shell", agent_flag=False)
+    assert "Full access, then /new, or add an allow rule" in answer
+    assert "no-shell tools" not in answer
+
+
+def test_kept_shell_wording_is_for_attended_runs_only() -> None:
+    cron = agy.denial_paragraph(
+        ["shell command"], mode="workspace", trigger="cron:x", kept_shell=True
+    )
+    assert "on this cron" in cron and "no-shell tools" not in cron
+    files = agy.denial_paragraph(
+        ["file outside the project"], mode="workspace", trigger=None
+    )
+    assert "no-shell tools" not in files
+
+
+def test_kept_shell_composes_with_the_plan_first_notice() -> None:
+    """#1060 with #981: a plan turn on a conversation that started in Full
+    access reaches for the shell too; the plan notice keeps its own line and
+    adds the /new hint (attended only)."""
+    plan = agy.denial_paragraph(
+        ["shell command"], mode="plan", trigger=None, kept_shell=True
+    )
+    assert "Plan first doesn't let it change anything until you approve a plan." in (
+        plan
+    )
+    assert plan.endswith("Send /new to plan in a fresh conversation.")
+    assert "Full access, then /new" not in plan
+    plain = agy.denial_paragraph(["shell command"], mode="plan", trigger=None)
+    assert "/new" not in plain
+    cron = agy.denial_paragraph(
+        ["shell command"], mode="plan", trigger="cron:x", kept_shell=True
+    )
+    assert "/new" not in cron
 
 
 @pytest.fixture(autouse=True)

@@ -15,12 +15,18 @@ stream-json user line (never in argv), the stream comes back as
 - ``result`` — ``status`` ``SUCCESS`` / ``ERROR``; ``usage``, ``num_turns``
   and ``duration_seconds`` are **session-cumulative** across resumes
 
-Safety (phase 02, D21): ``--dangerously-skip-permissions`` is passed only
-when a human explicitly chose **Full access** (``/config``, ``[antigravity]
-permission_mode = "full"`` or a cron's own ``permission_mode``); unknown
-values fail closed to Workspace, unattended runs never inherit Full access
-(08 §10), and "Ask me" / "Plan first" are refused until Untether's approval
-gate ships. The runner also refuses to run without a project directory or on
+Safety (phase 02, D21; phase 14): ``--dangerously-skip-permissions`` is
+passed only through :func:`decide_antigravity_mode` — when a human
+explicitly chose **Full access** (``/config``, ``[antigravity]
+permission_mode = "full"`` or a cron's own ``permission_mode``), or chose
+**Ask me** and Untether's approval gate is ready for the project (#980: the
+gate then answers every tool, and anything less refuses the run). Unknown
+values fail closed to Workspace, and unattended runs never inherit Full
+access or Ask me (08 §10).
+"Plan first" (#981) runs agy's own ``--mode=plan`` under the no-shell agent:
+the turn stops after writing its plan, the plan is posted with Approve /
+Deny / Let's discuss, and Approve resumes the conversation in Workspace
+(``utils/antigravity_plan.py``). The runner also refuses to run without a project directory or on
 agy older than 1.3.1, cross-checks agy's own settings (``-p /config``) and the
 reported ``init.permission_mode``, and warns about agy hooks, plugins and MCP
 servers it doesn't manage (REVIEW-2 B2).
@@ -46,12 +52,12 @@ import anyio
 import msgspec
 
 from ..backends import EngineBackend, EngineConfig
-from ..background_status import escape_markdown
+from ..background_status import escape_markdown, live_shown
 from ..background_tasks import EngineBackgroundTask
 from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
-from ..markdown import HARD_BREAK
+from ..markdown import HARD_BREAK, inline_code
 from ..model import (
     Action,
     ActionEvent,
@@ -63,6 +69,8 @@ from ..model import (
 )
 from ..runner import (
     PRESPAWN_BLOCKED_KEY,
+    RETIRED_CARDS_KEY,
+    REVIEW_CARD_KEY,
     JsonlSubprocessRunner,
     ResumeTokenMixin,
     Runner,
@@ -70,6 +78,7 @@ from ..runner import (
     _session_label,
 )
 from ..schemas import antigravity as agy_schema
+from ..session_costs import RUN_TOKENS_KEY
 from ..utils import antigravity_context, antigravity_quota, antigravity_scan
 from ..utils.antigravity_redact import redact_agy_text
 from ..utils.antigravity_state import (
@@ -268,6 +277,19 @@ _DENIED_LABEL: dict[str, str] = {
     "read_file": "file outside the project",
     "write_file": "file outside the project",
 }
+# #1073: in Plan first a refused write is plan mode itself (agy denies every
+# file change but the plan, inside the project too: the rc4 QA run's copy to
+# ``.untether-outbox/``). A refused read is still outside the project (the
+# QA ``ListDir`` was the project's parent); in-project reads go ahead.
+_PLAN_WRITE_LABEL = "file change"
+_OUTSIDE_LABEL = "file outside the project"
+
+
+def _denied_label(action: str, mode: str | None) -> str:
+    if mode == "plan" and action == "write_file":
+        return _PLAN_WRITE_LABEL
+    return _DENIED_LABEL.get(action, "tool")
+
 
 # ── stderr kill classes (phase 03, D27) ─────────────────────────────────────
 
@@ -288,12 +310,25 @@ _AUTH_PREFIXES = (
     "waiting for authentication",
 )
 _TOS_WORDS = ("block", "appeal", "violat", "suspend")
+# #980 (13 §7): only a run whose safety rests on the gate (phase 14's gated
+# modes, ``GateRun.required``) is stopped by these.
+GATE_NOT_RUNNING_TEXT = (
+    "Telegram approvals aren't running for this agy run (its hooks never"
+    " reached Untether), so Untether stopped it before any change. Run"
+    " `untether agy-gate status` on the host."
+)
+GATE_TRIPWIRE_TEXT = (
+    "Telegram approvals stopped responding during this agy run, so Untether"
+    " stopped it. Run `untether agy-gate status` on the host."
+)
 _KILL_TEXT: dict[str, str] = {
     "auth": AUTH_TEXT,
     "account_blocked": ACCOUNT_BLOCKED_TEXT,
     "quota": QUOTA_TEXT,
     "credits": CREDITS_TEXT,
     "conversation_gone": CONVERSATION_GONE_TEXT,
+    "gate_not_running": GATE_NOT_RUNNING_TEXT,
+    "gate_tripwire": GATE_TRIPWIRE_TEXT,
 }
 _KILL_DETECTED_EVENT: dict[str, str] = {
     "auth": "antigravity.auth.required",
@@ -307,6 +342,8 @@ _KILL_DONE_EVENT: dict[str, str] = {
     "quota": "antigravity.quota.killed",
     "credits": "antigravity.credits.killed",
     "conversation_gone": "antigravity.conversation.killed",
+    "gate_not_running": "antigravity.gate.killed",
+    "gate_tripwire": "antigravity.gate.killed",
 }
 
 
@@ -385,6 +422,11 @@ _AGY_BACKGROUND_CAP_S = 1860.0
 # ``CommandLine``. Where the parameters do carry it, that value decides when
 # the command counts as background; otherwise it does after this long.
 _BACKGROUND_TITLE_AFTER_S = 5.0
+# #1062: agy (1.3.3, 1.3.4) ends a step it killed (``manage_task``) DONE with
+# ``tool_info.error.message`` "context canceled", and names the task it
+# kills as ``<conversation id>/task-<step index>``.
+_CANCELLED_RE = re.compile(r"\bcancell?ed\b", re.IGNORECASE)
+_KILLED_TASK_RE = re.compile(r"(?:^|/)task-(\d+)$")
 _ASYNC_WAIT_MAX_MS = 600_000
 _BACKGROUND_TITLE_CHARS = 120
 # Finished entries are dropped from the task map beyond this many.
@@ -397,10 +439,18 @@ _DESCENDANT_SCAN_MAX = 1024
 # (``gemini-3.8-flash-high``); agy refuses a different ``--effort`` with it.
 _EFFORT_SUFFIX_RE = antigravity_context.EFFORT_SUFFIX_RE
 _MODEL_ROW_CHARS = 80
+# #1058: the started title (``/export``'s "Model:") when no model was passed
+# and ``init`` named none (agy names its model only when ``--model`` is set).
+DEFAULT_MODEL_TITLE = "agy default"
 # #979: the ``telemetry`` action behind the header's ``~N% ctx``.
 _CONTEXT_ACTION_ID = "antigravity.context"
 
 _OUTPUT_PREVIEW_CHARS = 500
+# 13 §7.1: steps only a model call produces. ``user_input``,
+# ``system_message`` and ``checkpoint`` don't count: a resumed run emits a
+# ``system_message`` before its first model call.
+_MODEL_STEP_TYPES = frozenset({"agent_response", "tool", "subagent", "finish"})
+_STEER_SNIPPET_CHARS = 80
 _ERROR_MESSAGE_CHARS = 300
 _INVALID_LINE_CHARS = 200
 
@@ -420,7 +470,7 @@ _AGY_ENV_EXTRAS: tuple[str, ...] = (
 
 _MIN_AGY_VERSION: tuple[int, ...] = (1, 3, 1)
 # The newest agy the fixtures and drift notes were checked against.
-PROBED_CLI_VERSION = "1.3.3"
+PROBED_CLI_VERSION = "1.3.4"
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 _VERSION_PROBE_TIMEOUT_S = 10.0
 _VERSION_CACHE: dict[tuple[str, float], str | None] = {}
@@ -508,6 +558,19 @@ def unsupported_version_message(version: str) -> str:
 # ── permission modes (phase 02, D21; 08 §10) ────────────────────────────────
 
 BYPASS_FLAG = "--dangerously-skip-permissions"
+# What agy's ``init.permission_mode`` says under the bypass flag (agy 1.3.3,
+# probes pb4/hook_deny_bypass).
+BYPASS_REPORTED = "always-proceed"
+
+
+def ask_mode_mismatch_message(reported: str) -> str:
+    return (
+        f"agy started in a permission mode Untether didn't ask for "
+        f"({reported}), so this Ask me run was stopped before any tool ran. "
+        "Check for an Untether update, or pick Workspace in /config."
+    )
+
+
 # Workspace = agy's own accept-edits mode. With no flag, print mode
 # soft-denies every file write outside a temp folder, so the project itself
 # is read-only (agy 1.3.3, probed 2026-10-11 in a non-temp repo; the rc1
@@ -516,8 +579,9 @@ BYPASS_FLAG = "--dangerously-skip-permissions"
 # ``init.permission_mode`` still reports ``request-review``. A fixed value,
 # never a user's; ``agy_flag`` allows nothing else for this flag.
 WORKSPACE_AGY_MODE = "accept-edits"
-_GATE_MODES = frozenset({"ask", "plan"})
-_GATE_MODE_NAMES = {"ask": "Ask me", "plan": "Plan first"}
+# Modes that run on agy's own permission checks (no bypass flag), so agy's
+# tool-permission setting must be its default or stricter (#1044, D22.7).
+_NO_BYPASS_MODES = frozenset({"workspace", "plan"})
 
 # agy ``toolPermission`` / ``init.permission_mode`` values a Workspace run
 # may proceed under. Anything else — ``always-proceed`` (D22.7),
@@ -598,12 +662,158 @@ def _reset_permission_warnings() -> None:
     _BYPASS_UNREPORTED_WARNED = False
 
 
-def gate_missing_message(mode: str) -> str:
-    name = _GATE_MODE_NAMES.get(mode, mode)
+# ── Ask me (#980, phase 14): the one place that decides bypass ───────────────
+
+# Pre-spawn blocks of an Ask me run whose gate isn't ready (answered as a
+# plain reply, #1047; the chat's session is kept).
+GATE_NOT_READY_BLOCK = "gate_not_ready"
+GATE_FOREIGN_BLOCK = "gate_foreign_config"
+GATE_SELF_PROTECT_BLOCK = "gate_self_protect"
+_ASK_ELSEWHERE = "Nothing was run. Workspace and Full access still work here."
+GATE_MISSING_TEXT = (
+    "Ask me needs Telegram approvals, which aren't set up on this host. Run "
+    "`untether agy-gate install` on the host (`untether agy-gate status` "
+    "shows what's missing; /config → 🔐 Telegram approvals shows the same). "
+    + _ASK_ELSEWHERE
+)
+
+
+def gate_not_ready_message(reason: str) -> str:
     return (
-        f"{name} needs Untether's approval gate, which arrives in a later "
-        "0.36.1 release — switch to Workspace or Full access in /config."
+        "Ask me needs Telegram approvals, and they aren't ready for this "
+        f"project: {reason}. Run `untether agy-gate status --project <folder>` "
+        "on the host to see what to repair. " + _ASK_ELSEWHERE
     )
+
+
+def _gate_paths(
+    config_path: Path | None, cwd: Path | None
+) -> tuple[str, tuple[Path, ...]]:
+    """Security review 3 (H1, M5): this instance's ``files.outbox_dir`` and
+    every project's ``@branch`` worktree root, from the live config. The
+    default ``.worktrees`` in the run's folder counts too unless the run's
+    folder is a configured project; with no readable config, the defaults."""
+    from ..antigravity import gate_policy
+
+    try:
+        from ..settings import load_settings_if_exists
+
+        loaded = load_settings_if_exists(config_path)
+    except Exception:  # noqa: BLE001 — the safe defaults below still apply
+        logger.warning("antigravity.gate.settings_unreadable", exc_info=True)
+        loaded = None
+    outbox_dir = gate_policy.DEFAULT_OUTBOX_DIR
+    roots: list[Path] = []
+    projects: set[str] = set()
+    if loaded is not None:
+        settings, path = loaded
+        outbox_dir = settings.transports.telegram.files.outbox_dir
+        for entry in settings.projects.values():
+            project = Path(entry.path).expanduser()
+            if not project.is_absolute():
+                project = path.parent / project
+            projects.add(os.path.realpath(project))
+            worktrees = Path(entry.worktrees_dir).expanduser()
+            roots.append(worktrees if worktrees.is_absolute() else project / worktrees)
+    if cwd is not None and os.path.realpath(cwd) not in projects:
+        roots.append(cwd / ".worktrees")
+    return outbox_dir, tuple(roots)
+
+
+def gate_self_protect_message(path: str) -> str:
+    return (
+        "Ask me isn't available in this project: it contains Untether's own "
+        f"code ({path}), which agy could edit to switch Telegram approvals "
+        "off. Use Workspace or Full access here."
+    )
+
+
+def gate_foreign_message(paths: list[str]) -> str:
+    return (
+        "Ask me isn't available in this project: agy loads hooks, plugins, "
+        "agents or MCP servers here that Untether doesn't manage "
+        f"({_paths_text(paths)}), and they run their own commands without "
+        "asking in Telegram. " + _ASK_ELSEWHERE + " Remove them (or move them "
+        "out of the project) to use Ask me."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GateFacts:
+    """What run_impl learnt about the gate before spawn (Ask me only)."""
+
+    installed: bool = False  # the plugin folder holds Untether's files
+    problem: str | None = None  # why the plugin or agy's listing isn't ready
+    self_protect: str | None = None  # REVIEW-2 B3 path
+    foreign: tuple[str, ...] = ()  # untrusted config in scope (REVIEW-2 B2)
+    listening: bool = False  # this run's socket is bound
+
+
+@dataclass(frozen=True, slots=True)
+class ModeDecision:
+    """How an agy run starts. ``build_args`` reads only this."""
+
+    mode: str  # workspace / ask / plan / full (after fail-closed mapping)
+    bypass: bool = False  # --dangerously-skip-permissions
+    gated: bool = False  # GateRun.required: the gate is the only check
+    no_shell_agent: bool = True  # --agent=untether-workspace (when it can)
+    refusal: str | None = None  # refuse before spawn with this text
+    block: str | None = None  # its PRESPAWN_BLOCKED_KEY value
+
+
+def decide_antigravity_mode(mode: str, gate: GateFacts | None = None) -> ModeDecision:
+    """Phase 14 §1: the single decision point for the bypass flag.
+
+    ``mode`` is :meth:`AntigravityRunner._effective_mode`'s answer (the
+    unattended downgrade and the fail-closed mapping already applied).
+
+    - Workspace / Plan first: agy's own checks, Untether's no-shell agent.
+    - Full access: bypass, agy's default agent; the gate (if installed) only
+      asks questions.
+    - Ask me: bypass **only** when the gate is ready — plugin installed and
+      listed by agy for this project (``gate_precheck.check(...).ok``), no
+      untrusted hook / plugin / agent / MCP server in scope, the project
+      doesn't hold Untether's own code, and the socket is listening. Then the
+      gate is required (deny-by-default) and agy runs on its default agent
+      with no ``--mode`` (G1/G2: the no-shell agent would leave nothing to
+      ask about, and ``--mode`` takes one value). Anything less refuses the
+      run — never a silent downgrade (REVIEW-2 M17).
+    - Anything else fails closed to Workspace (D21).
+    """
+    if mode == "full":
+        return ModeDecision(mode="full", bypass=True, no_shell_agent=False)
+    if mode == "plan":
+        return ModeDecision(mode="plan")
+    if mode != "ask":
+        return ModeDecision(mode="workspace")
+    refused = ModeDecision(mode="ask", no_shell_agent=False)
+    if gate is None or not gate.installed:
+        return replace(refused, refusal=GATE_MISSING_TEXT, block=GATE_MISSING_BLOCK)
+    if gate.problem is not None:
+        return replace(
+            refused,
+            refusal=gate_not_ready_message(gate.problem),
+            block=GATE_NOT_READY_BLOCK,
+        )
+    if gate.self_protect is not None:
+        return replace(
+            refused,
+            refusal=gate_self_protect_message(gate.self_protect),
+            block=GATE_SELF_PROTECT_BLOCK,
+        )
+    if gate.foreign:
+        return replace(
+            refused,
+            refusal=gate_foreign_message(list(gate.foreign)),
+            block=GATE_FOREIGN_BLOCK,
+        )
+    if not gate.listening:
+        return replace(
+            refused,
+            refusal=gate_not_ready_message("Untether couldn't open its socket"),
+            block=GATE_NOT_READY_BLOCK,
+        )
+    return ModeDecision(mode="ask", bypass=True, gated=True, no_shell_agent=False)
 
 
 def _warn_unknown_mode(value: str) -> None:
@@ -664,11 +874,33 @@ def _join_labels(labels: list[str]) -> str:
     return ", ".join(labels[:-1]) + " and " + labels[-1]
 
 
-def denial_paragraph(labels: list[str], *, mode: str, trigger: str | None) -> str:
-    """Why the run stopped and how to allow it — trigger-aware (audit §6)."""
+def denial_paragraph(
+    labels: list[str],
+    *,
+    mode: str,
+    trigger: str | None,
+    kept_shell: bool = False,
+) -> str:
+    """Why the run stopped and how to allow it — trigger-aware (audit §6).
+
+    ``kept_shell`` (#1060): a resumed Workspace or Plan first run under
+    Untether's no-shell agent still called the shell, so the conversation started under another
+    agent (Full access, usually) and agy kept it — agy ignores ``--agent`` on
+    a resume. Full access then /new is the wrong advice there."""
     what = f"⚠️ Antigravity was blocked from using a {_join_labels(labels)}"
     if mode == "full":
         return f"{what} by agy's own deny rules (`permissions.deny` in agy's settings file)."
+    if mode == "plan":
+        # #981: a plan turn may only read and write its plan.
+        text = _plan_denial_text(labels)
+        if kept_shell and trigger is None:
+            # #1060: it reached for a shell the no-shell agent doesn't have.
+            text += (
+                " This conversation started without the no-shell tools (in Full"
+                " access, for example), and agy keeps the tools a conversation"
+                " started with. Send /new to plan in a fresh conversation."
+            )
+        return text
     head = f"{what} — headless runs can't ask for approval, so it stopped there."
     # An allow rule only helps for a shell command (#1037): agy has no rule
     # that lets a run reach a file outside the project.
@@ -686,9 +918,35 @@ def denial_paragraph(labels: list[str], *, mode: str, trigger: str | None) -> st
         return f"{head} Webhook runs never get Full access; {tail}."
     if trigger is not None:
         return f'{head} To allow it, set `permission_mode = "full"` on this cron{rule}.'
+    if kept_shell:
+        return (
+            f"{head} This conversation started without Workspace's no-shell"
+            " tools (in Full access, for example), and agy keeps the tools a"
+            " conversation started with, so it still tried the shell. Send /new"
+            " to start a Workspace conversation, or pick Full access in /config"
+            " to let it run."
+        )
     # A conversation that started in Workspace keeps its no-shell agent.
     return (
         f"{head} To allow it: /config → Permission mode → Full access, then /new{rule}."
+    )
+
+
+def _plan_denial_text(labels: list[str]) -> str:
+    """#1073: a Plan first denial names what plan mode refused — a file
+    change anywhere (the plan is the only write), a file outside the project
+    (as in Workspace) — rather than calling every file one outside."""
+    others = [label for label in labels if label != _PLAN_WRITE_LABEL]
+    parts = ["changing a file"] if _PLAN_WRITE_LABEL in labels else []
+    if others:
+        parts.append(f"using a {_join_labels(others)}")
+    what = "⚠️ Antigravity was blocked from " + " and from ".join(parts)
+    if _PLAN_WRITE_LABEL in labels:
+        return f"{what} — Plan first doesn't change files until you approve the plan."
+    if others == [_OUTSIDE_LABEL]:
+        return f"{what} — Plan first works only with the project's own files."
+    return (
+        f"{what} — Plan first doesn't let it change anything until you approve a plan."
     )
 
 
@@ -705,6 +963,83 @@ def config_changed_message(paths: list[str]) -> str:
         "held. The next message someone sends in the chat will run with the "
         "changed config and show what changed in a ⚠️ row; the schedule runs "
         "again after that. Check those files first if you didn't change them."
+    )
+
+
+PLUGIN_OUTDATED_ROW = (
+    "⚠️ Untether's agy plugin (untether-gate) is from another Untether "
+    "version. Telegram questions, steering and Ask me are off until you run "
+    "`untether agy-gate install` on the host."
+)
+
+
+def gate_plugin_outdated(install: Any) -> bool:
+    """Installed by Untether and unedited, and byte-identical to what an
+    earlier Untether wrote (an upgrade changed the templates: run ``untether
+    agy-gate install``). Files changed together with their record never
+    count: they get the "changed" wording."""
+    return (
+        install.present
+        and install.managed
+        and not install.edited
+        and install.problem is None
+        and not install.current
+        and getattr(install, "previous_version", None) is not None
+    )
+
+
+def gate_plugin_changed(install: Any) -> bool:
+    """A present plugin folder that isn't byte-for-byte what this Untether
+    installed (``gate_plugin.InstallState``; fail closed)."""
+    return install.present and (
+        not install.managed
+        or bool(install.edited)
+        or install.problem is not None
+        or not install.current
+    )
+
+
+def gate_plugin_held_message(install: Any) -> str:
+    """#1078: a scheduled run held because Untether's agy plugin isn't the
+    one it installed. Unlike a changed workspace config, a chat message
+    doesn't clear this hold: every unattended run stays held until the
+    plugin is reinstalled.
+
+    Markdown (#1083): sent as the held run's answer as well as its error
+    (:func:`_plugin_held`), so the commands render as code, like the 🔐
+    page's, instead of as literal backticks inside the error card's code
+    block. The summary can name files someone added to the folder, so it is
+    escaped."""
+    if gate_plugin_outdated(install):
+        return (
+            "Untether's agy plugin (untether-gate) is from another Untether "
+            "version, so this scheduled run is held. Scheduled Antigravity runs "
+            "stay held until you run `untether agy-gate install` on the host; a "
+            "message in the chat doesn't release them."
+        )
+    force = not install.managed or bool(install.edited) or install.problem is not None
+    command = "untether agy-gate install" + (" --force" if force else "")
+    return (
+        "Untether's agy plugin (untether-gate) isn't what Untether installed "
+        f"({escape_markdown(install.summary())}), so this scheduled run is "
+        "held. Its hooks run in every agy session on this host, so scheduled "
+        "Antigravity runs stay held until the plugin is restored; a message in "
+        "the chat doesn't release them. Check what changed in "
+        f"{inline_code(str(install.path))}, then run `{command}` on the host."
+    )
+
+
+def _plugin_held(install: Any, resume: ResumeToken | None) -> CompletedEvent:
+    """A scheduled run held by :func:`gate_plugin_held_message`. The text is
+    the answer too (one line, so the bridge shows it once, rendered, with no
+    code block under it: ``runner_bridge`` dedupes an error whose first line
+    is the answer's)."""
+    text = gate_plugin_held_message(install)
+    return EventFactory(ENGINE).completed_error(
+        error=text,
+        answer=text,
+        resume=resume,
+        usage={PRESPAWN_BLOCKED_KEY: CONFIG_CHANGED_BLOCK},
     )
 
 
@@ -744,6 +1079,10 @@ class _RunPrecheck:
     cwd: Path | None = None
     scan: antigravity_scan.ScanResult | None = None
     first_sight: bool = False  # show the "hooks … Untether doesn't manage" row
+    # #1083: the ``antigravity.gate.changed`` row covers Untether's own
+    # plugin folder, so the row above leaves those files out (the scan still
+    # tracks them: the digest and the cron hold are unchanged).
+    gate_plugin_row: bool = False
     # The planted-config scan failed or was truncated: show a ⚠️ row (never
     # record a digest as seen); unattended runs were already refused.
     scan_problem: str | None = None
@@ -767,6 +1106,15 @@ _PRECHECK: contextvars.ContextVar[_RunPrecheck | None] = contextvars.ContextVar(
 # /continue (``AntigravityStreamState.from_continue``).
 _FROM_CONTINUE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "untether_agy_from_continue", default=False
+)
+# #980: same hand-off — the run's gate, bound before spawn (its socket path
+# goes into agy's env).
+_GATE: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "untether_agy_gate", default=None
+)
+# #980 phase 14: same hand-off — how the run starts (``build_args``).
+_DECISION: contextvars.ContextVar[ModeDecision | None] = contextvars.ContextVar(
+    "untether_agy_decision", default=None
 )
 
 
@@ -954,6 +1302,10 @@ class AntigravityStreamState:
     ctx_emitted: tuple[int, int] | None = None
     ctx_miss_logged: bool = False
     ctx_over_warned: bool = False
+    # #1062: this run's own token use — the sum of its model calls'
+    # ``agent_response`` usage. ``result.usage`` is the conversation's running
+    # total, which also counts a cancelled run that never reported a result.
+    run_tokens: dict[str, int] = field(default_factory=dict)
     text_by_step: dict[int, str] = field(default_factory=dict)
     pending_actions: dict[str, Action] = field(default_factory=dict)
     # DONE + empty output + deniable family → verdict unknown until a later
@@ -977,6 +1329,10 @@ class AntigravityStreamState:
     # ``system_message`` steps still expected for a finished background
     # command / timer; those are not a subagent finishing.
     bg_notices_owed: int = 0
+    # #1062: a command / timer step that ended cancelled before it counted
+    # as background, held (not listed) in case a ``manage_task`` kill names
+    # it next.
+    cancelled_steps: dict[str, EngineBackgroundTask] = field(default_factory=dict)
     agy_pid: int | None = None
     # Phase 05: the ``--effort`` level actually passed (footer), and the one
     # ⚠️ row to show when a stored level was dropped for this model.
@@ -1020,6 +1376,57 @@ class AntigravityStreamState:
     agy_error: dict[str, Any] | None = None
     stderr_flags: set[str] = field(default_factory=set)
     result_seen: bool = False
+    # #981 Plan first: ``TargetFile`` of every finished write in a plan run
+    # (the plan is the one inside ``brain/<conversation id>/``), and the
+    # plan an Approve resumed this run for (its file name).
+    plan_writes: list[str] = field(default_factory=list)
+    approved_plan: str | None = None
+    # #1074: plan cards this run's plan turn replaced (request ids).
+    superseded_cards: list[str] = field(default_factory=list)
+    # #980/#981: this run's gate (``antigravity/gate_server.GateRun``) when
+    # Untether's agy plugin is installed and ``-p /hooks`` lists it; None
+    # otherwise (no marker env reaches agy, nothing changes).
+    gate: Any = None
+    gate_liveness_logged: bool = False
+    # #980 phase 14: how this run started (``decide_antigravity_mode``).
+    decision: ModeDecision | None = None
+    # #1080: parent tool steps waiting on an Ask me approval card, and the
+    # wait each held command had before it counts as background.
+    approval_steps: set[int] = field(default_factory=set)
+    approval_held: dict[str, float | None] = field(default_factory=dict)
+
+    def note_approval_wait(self, step: int, waiting: bool) -> None:
+        """#1080: a step waiting on an approval card isn't background work —
+        agy hasn't run it yet. Its rows stay out of the ⏳ block until the
+        card is answered, and their clocks start then (``GateRun``)."""
+        if waiting:
+            self.approval_steps.add(step)
+        else:
+            self.approval_steps.discard(step)
+        now = time.monotonic()
+        for key, task in self.tasks.items():
+            if task.status != "running" or not (
+                key in (f"cmd:{step}", f"timer:{step}")
+                or key.startswith(f"sub:{step}:")
+            ):
+                continue
+            if waiting:
+                self.hold_for_approval(task)
+            elif key in self.approval_held:
+                offset = self.approval_held.pop(key)
+                task.started_at = now
+                task.background_from = None if offset is None else now + offset
+        if not waiting and step in self.bg_steps:
+            self.bg_steps[step] = now
+
+    def hold_for_approval(self, task: EngineBackgroundTask) -> None:
+        if task.task_id in self.approval_held:
+            return
+        start = task.background_from
+        self.approval_held[task.task_id] = (
+            None if start is None else max(0.0, start - task.started_at)
+        )
+        task.background_from = float("inf")
 
     def has_live_background_work(self) -> bool:
         """REVIEW-2 B1: answers ``runner_bridge.engine_background_busy``."""
@@ -1036,6 +1443,64 @@ class AntigravityStreamState:
             return False
         oldest = min(self.bg_steps.values())
         return time.monotonic() - oldest < _AGY_BACKGROUND_CAP_S
+
+    # #1061: agy prints nothing while it holds its answer for background
+    # work, and a cancel during the hold ends with an empty ``response``
+    # (probe rc4-h1), so the answer can't be shown from the stream. These two
+    # lines, duck-typed by ``runner_bridge``, say so where the user looks.
+
+    def background_hold_note(self) -> str:
+        """The last line of the ``⏳ background`` block. With the gate, agy's
+        own ``Stop`` hook says when the model has finished its turn and agy
+        is only waiting for background work (``fullyIdle: false``)."""
+        gate = self.gate
+        if gate is not None and gate.stop_not_idle:
+            return BACKGROUND_TURN_DONE_NOTE
+        return BACKGROUND_HOLD_NOTE
+
+    # Duck-typed by the watchdog (``runner._approval_pending``) and the
+    # bridge's stall / unanswerable-request monitors (#684): a question held
+    # by the gate is an expected wait, not a hang.
+
+    def awaiting_user_approval(self) -> bool:
+        gate = self.gate
+        if gate is None:
+            return False
+        from ..interactive import pending_control_requests_for_session
+
+        return pending_control_requests_for_session(gate.session_key) > 0
+
+    def control_request_snapshot(self, now: float | None = None) -> list[Any]:
+        gate = self.gate
+        if gate is None:
+            return []
+        from ..interactive import snapshot
+
+        return snapshot(gate.session_key, now=now)
+
+    def cancelled_hold_note(self) -> str | None:
+        """The cancelled progress message's note, when the run was cancelled
+        while a listed background task was still running."""
+        if not live_shown(self.tasks.values()):
+            return None
+        return CANCELLED_HOLD_NOTE
+
+
+# #1061. The held answer stays in agy's conversation (probe rc4-h2: a
+# resumed "repeat your previous answer" returned it word for word).
+BACKGROUND_HOLD_NOTE = "agy sends its answer when this work finishes (up to 30 min)"
+# The gate's ``Stop`` hook reported ``fullyIdle: false`` (probe pb2: the
+# model's turn is over and agy waits for a timer or a background task, which
+# may still start another model call).
+BACKGROUND_TURN_DONE_NOTE = (
+    "agy has finished its turn and sends the answer when this work finishes"
+    " (up to 30 min)"
+)
+CANCELLED_HOLD_NOTE = (
+    "⏳ Cancelled while agy was holding its answer for background work, so"
+    " it wasn't shown. The conversation kept it: send a message such as"
+    ' "repeat your last answer" to see it.'
+)
 
 
 # ── runner ──────────────────────────────────────────────────────────────────
@@ -1065,9 +1530,11 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     model: str | None = None
     # ``[antigravity] permission_mode`` (validated in build_runner).
     default_permission_mode: str | None = None
+    # ``[antigravity] approval_timeout_s`` (#980): Ask me's approval wait,
+    # capped by the gate plugin's own (set at ``untether agy-gate install``).
+    approval_timeout_s: int | None = None
     # untether.toml; the small state files live beside chat_prefs.json.
     config_path: Path | None = None
-    session_title: str = "antigravity"
     logger = logger
     _EXPOSE_ENGINE_STATE = True
     _seen_store: SeenConfigStore | None = field(default=None, init=False, repr=False)
@@ -1124,40 +1591,59 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if precheck_block is not None:
             yield precheck_block
             return
+        gate_block, gate, decision = await self._gate_setup(precheck, resume)
+        if gate_block is not None:
+            yield gate_block
+            return
+        if decision.mode != "ask" and resume is not None:
+            # "Always allow this command" lasts while the conversation stays
+            # in Ask me (phase 14 §5).
+            from ..antigravity import gate_policy
+
+            gate_policy.forget_grants(resume.value)
         # Consumed by ``new_state`` inside the base run_impl (same task).
         _PRECHECK.set(precheck)
         _FROM_CONTINUE.set(from_continue)
+        _GATE.set(gate)
+        _DECISION.set(decision)
         _log_tos_notice_once()
         # #1045: the ⚠️ rows shown on the progress message, for the final.
         warnings: list[str] = []
-        # Explicit parent ref: zero-arg super() breaks in @dataclass(slots=True).
-        async with contextlib.aclosing(
-            JsonlSubprocessRunner.run_impl(self, prompt, resume)
-        ) as events:
-            async for evt in events:
-                if (
-                    isinstance(evt, CompletedEvent)
-                    and precheck is not None
-                    and precheck.scan is not None
-                ):
-                    # Off the event loop: the re-scan is bounded but blocking.
-                    rows: list[UntetherEvent] | None = None
-                    with anyio.move_on_after(antigravity_scan.SCAN_TIMEOUT_S):
-                        rows = await anyio.to_thread.run_sync(
-                            self._config_change_rows,
-                            precheck,
-                            abandon_on_cancel=True,
-                        )
-                    if rows is None:
-                        rows = [_recheck_warning("the check timed out")]
-                    for row in rows:
-                        _note_warning(warnings, row)
-                        yield row
-                if isinstance(evt, CompletedEvent):
-                    evt = _with_warning_block(evt, warnings)
-                else:
-                    _note_warning(warnings, evt)
-                yield evt
+        try:
+            # Explicit parent ref: zero-arg super() breaks in @dataclass(slots=True).
+            async with contextlib.aclosing(
+                JsonlSubprocessRunner.run_impl(self, prompt, resume)
+            ) as events:
+                async for evt in events:
+                    if (
+                        isinstance(evt, CompletedEvent)
+                        and precheck is not None
+                        and precheck.scan is not None
+                    ):
+                        # Off the event loop: the re-scan is bounded but blocking.
+                        rows: list[UntetherEvent] | None = None
+                        with anyio.move_on_after(antigravity_scan.SCAN_TIMEOUT_S):
+                            rows = await anyio.to_thread.run_sync(
+                                self._config_change_rows,
+                                precheck,
+                                abandon_on_cancel=True,
+                            )
+                        if rows is None:
+                            rows = [_recheck_warning("the check timed out")]
+                        for row in rows:
+                            _note_warning(warnings, row)
+                            yield row
+                    if isinstance(evt, CompletedEvent):
+                        evt = _with_warning_block(evt, warnings)
+                    else:
+                        _note_warning(warnings, evt)
+                    yield evt
+        finally:
+            _GATE.set(None)
+            _DECISION.set(None)
+            if gate is not None:
+                with anyio.CancelScope(shield=True):
+                    await gate.aclose()
 
     def _no_project_refusal(self, resume: ResumeToken | None) -> UntetherEvent | None:
         """REVIEW B1 / D16: agy edits files in its cwd, so never run it in the
@@ -1309,35 +1795,53 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         trigger = options.unattended_trigger if options is not None else None
         if (
             trigger is not None
-            and mode == "full"
-            and (options is None or options.trigger_permission_mode != "full")
+            and mode in {"full", "ask"}
+            and (options is None or options.trigger_permission_mode != mode)
         ):
-            key = (trigger, origin)
+            # REVIEW M3: a chat's (or untether.toml's) bypass mode never
+            # reaches a cron or webhook run; only the trigger's own setting
+            # does. Ask me runs agy with the bypass flag too (phase 14 §1).
+            key = (trigger, f"{origin}:{mode}")
             if key not in _UNATTENDED_DOWNGRADE_WARNED:
                 if len(_UNATTENDED_DOWNGRADE_WARNED) >= _WARNED_MAX:
                     _UNATTENDED_DOWNGRADE_WARNED.clear()
                 _UNATTENDED_DOWNGRADE_WARNED.add(key)
                 logger.warning(
-                    "antigravity.unattended_full_downgraded",
+                    f"antigravity.unattended_{mode}_downgraded",
                     trigger=trigger,
                     origin=origin,
-                    note="unattended runs get Full access only from the "
-                    "trigger's own permission_mode",
+                    note="unattended runs get Full access or Ask me only from "
+                    "the trigger's own permission_mode",
                 )
             mode = "workspace"
         return mode
 
     def _gate_missing_refusal(self, resume: ResumeToken | None) -> UntetherEvent | None:
-        """rc1: Ask me / Plan first need the approval gate (rc3) — refuse
-        before spawn rather than run them as something else."""
-        mode = self._effective_mode()
-        if mode not in _GATE_MODES:
+        """Ask me with no gate plugin on this host: refuse at once with the
+        install hint (before the version check and the scans). A plugin that
+        is there is checked properly in :meth:`_gate_setup`."""
+        if self._effective_mode() != "ask":
             return None
-        logger.warning("antigravity.permission_mode.gate_missing", mode=mode)
+        from ..antigravity import gate_plugin
+
+        if gate_plugin.inspect_install().present:
+            return None
+        return self._decision_refusal(decide_antigravity_mode("ask", None), resume)
+
+    @staticmethod
+    def _decision_refusal(
+        decision: ModeDecision, resume: ResumeToken | None
+    ) -> UntetherEvent:
+        assert decision.refusal is not None
+        logger.warning(
+            "antigravity.permission_mode.gate_refused",
+            mode=decision.mode,
+            reason=decision.block,
+        )
         return EventFactory(ENGINE).completed_error(
-            error=gate_missing_message(mode),
+            error=decision.refusal,
             resume=resume,
-            usage={PRESPAWN_BLOCKED_KEY: GATE_MISSING_BLOCK},
+            usage={PRESPAWN_BLOCKED_KEY: decision.block},
         )
 
     def _seen(self) -> SeenConfigStore:
@@ -1424,6 +1928,14 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     paths=paths[:20],
                     digest=scan.agy_digest[:12],
                 )
+                from ..antigravity import gate_plugin
+
+                # #1078: when the change includes Untether's own plugin, a
+                # chat message doesn't release the hold (``_gate_setup``
+                # keeps holding until it is reinstalled), so say that.
+                install = await anyio.to_thread.run_sync(gate_plugin.inspect_install)
+                if gate_plugin_changed(install):
+                    return _plugin_held(install, resume), None
                 return (
                     EventFactory(ENGINE).completed_error(
                         error=config_changed_message(paths),
@@ -1437,7 +1949,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         pre.config = config
         pre.auth_route = antigravity_quota.auth_route(config)
         tool_permission = config.tool_permission if config is not None else None
-        if mode == "workspace" and not tool_permission:
+        if mode in _NO_BYPASS_MODES and not tool_permission:
             # #1044: no usable value. An attended run goes on — ``init``
             # still has to report a safe one (``_check_reported_mode``) —
             # but nobody reads an unattended run's ⚠️ row, so that is held,
@@ -1462,7 +1974,10 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     ),
                     None,
                 )
-        elif mode == "workspace" and tool_permission not in _WORKSPACE_TOOL_PERMISSIONS:
+        elif (
+            mode in _NO_BYPASS_MODES
+            and tool_permission not in _WORKSPACE_TOOL_PERMISSIONS
+        ):
             logger.error(
                 "antigravity.permission_mode.mismatch",
                 source="config",
@@ -1533,6 +2048,162 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 )
             )
 
+    async def _gate_setup(
+        self, pre: _RunPrecheck | None, resume: ResumeToken | None
+    ) -> tuple[UntetherEvent | None, Any, ModeDecision]:
+        """#980: bind this run's gate socket when Untether's agy plugin is
+        installed and ``agy -p /hooks`` lists it for the run's cwd, and
+        decide how the run starts (:func:`decide_antigravity_mode`).
+
+        Workspace, Plan first and Full access don't rely on the gate for
+        safety, so a gate that isn't ready only means no Telegram questions
+        and no steering for the run (logged; the run goes on). Ask me relies
+        on it entirely: every gap refuses the run before spawn. One more
+        refusal for every mode: the plugin folder isn't what Untether
+        installed and the run is unattended — the planted-config scanner
+        leaves the plugin's own files to this check, and a changed hook runs
+        its own commands."""
+        from ..antigravity import gate_plugin, gate_precheck, gate_server
+
+        mode = self._effective_mode()
+        decision = decide_antigravity_mode(mode)
+        if pre is None or pre.cwd is None:
+            if mode == "ask":
+                return self._decision_refusal(decision, resume), None, decision
+            return None, None, decision
+        install = await anyio.to_thread.run_sync(gate_plugin.inspect_install)
+        if not install.present:
+            if mode == "ask":
+                return self._decision_refusal(decision, resume), None, decision
+            return None, None, decision
+        options = get_run_options()
+        trigger = options.unattended_trigger if options is not None else None
+        if gate_plugin_changed(install):
+            # Fail closed: only files byte-identical to this version's own
+            # templates count as Untether's. A manifest whose hashes match an
+            # edited hooks.json proves nothing (whatever rewrote one could
+            # rewrite both), and the planted-config scanner tracks such a
+            # folder too (``gate_plugin.verified_own_files``).
+            logger.warning(
+                "antigravity.gate.plugin_changed",
+                state=install.summary(),
+                path=str(install.path),
+                trigger=trigger,
+            )
+            outdated = gate_plugin_outdated(install)
+            if trigger is not None:
+                return _plugin_held(install, resume), None, decision
+            if mode == "ask":
+                reason = gate_precheck.OUTDATED if outdated else gate_precheck.EDITED
+                refused = decide_antigravity_mode(
+                    mode,
+                    GateFacts(
+                        installed=True, problem=gate_precheck.reason_text(reason)
+                    ),
+                )
+                return self._decision_refusal(refused, resume), None, refused
+            pre.gate_plugin_row = True
+            pre.config_rows.append(
+                (
+                    "antigravity.gate.changed",
+                    PLUGIN_OUTDATED_ROW
+                    if outdated
+                    else "⚠️ Untether's agy plugin (untether-gate) isn't what"
+                    f" Untether installed: {install.summary()}. Its hooks run in"
+                    " every agy session on this host. Telegram questions and"
+                    " steering are off; run `untether agy-gate status` on the"
+                    " host.",
+                )
+            )
+            return None, None, decision
+        scan = pre.scan
+        result = await gate_precheck.check(
+            self,
+            pre.cwd,
+            scan_digest=scan.agy_digest if scan is not None else None,
+            root=scan.root if scan is not None else None,
+        )
+        if mode == "ask":
+            facts = await self._ask_facts(pre, result)
+            decision = decide_antigravity_mode(mode, facts)
+            if decision.refusal is not None:
+                return self._decision_refusal(decision, resume), None, decision
+        elif not result.ok:
+            return None, None, decision
+        wait_s = result.wait_s
+        if self.approval_timeout_s is not None:
+            # ``[antigravity] approval_timeout_s``: shorter than the
+            # plugin's own wait, never longer (agy's hook timeout is fixed
+            # at install time).
+            wait_s = min(wait_s, self.approval_timeout_s)
+        outbox_dir, worktree_roots = _gate_paths(self.config_path, pre.cwd)
+        gate = gate_server.GateRun(
+            config_path=self.config_path,
+            factory=EventFactory(ENGINE),
+            wait_s=wait_s,
+            unattended_trigger=trigger,
+            ask_questions=options.ask_questions if options is not None else None,
+            required=decision.gated,
+            project_root=pre.cwd,
+            diff_preview=options.diff_preview if options is not None else None,
+            channel_id=get_run_channel_id(),
+            outbox_dir=outbox_dir,
+            outside=worktree_roots,
+        )
+        try:
+            await gate.open()
+        except (OSError, gate_server.GateSocketError) as exc:
+            logger.warning(
+                "antigravity.gate.socket_failed",
+                error_type=exc.__class__.__name__,
+                error=str(exc)[:200],
+            )
+            if mode == "ask":
+                refused = decide_antigravity_mode(mode, replace(facts, listening=False))
+                return self._decision_refusal(refused, resume), None, refused
+            return None, None, decision
+        return None, gate, decision
+
+    async def _ask_facts(self, pre: _RunPrecheck, result: Any) -> GateFacts:
+        """Ask me's gate facts: agy's own listing (``result``, a
+        ``GatePrecheck``), Untether's own code in the project, and config that
+        runs commands outside the gate (hooks, plugins, agents, MCP)."""
+        from ..antigravity import gate_precheck
+
+        if not result.ok:
+            return GateFacts(
+                installed=True, problem=gate_precheck.reason_text(result.reason)
+            )
+        if pre.scan_problem is not None or pre.scan is None:
+            # The planted-config scan didn't finish: nothing proves the
+            # project carries no hooks or MCP servers of its own.
+            why = pre.scan_problem or "the check didn't run"
+            return GateFacts(
+                installed=True,
+                problem=f"Untether couldn't check this project's agy config ({why})",
+            )
+        foreign = await gate_precheck.foreign_config(self, result, pre.scan)
+        if foreign:
+            logger.warning(
+                "antigravity.gate.precheck_failed",
+                reason="foreign_config",
+                paths=list(foreign)[:20],
+                cwd=str(pre.cwd),
+            )
+        if result.self_protect is not None:
+            logger.warning(
+                "antigravity.gate.precheck_failed",
+                reason=gate_precheck.SELF_PROTECT,
+                path=result.self_protect,
+                cwd=str(pre.cwd),
+            )
+        return GateFacts(
+            installed=True,
+            self_protect=result.self_protect,
+            foreign=foreign,
+            listening=True,
+        )
+
     async def _unsupported_version_event(
         self, resume: ResumeToken | None
     ) -> UntetherEvent | None:
@@ -1582,9 +2253,10 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # ``--flag=value`` so agy can't read it as another flag. It raises
         # ``AgyArgvError`` on a bad value; ``run_impl`` refused that run
         # before getting here.
-        from ..utils import antigravity_agent
+        from ..utils import antigravity_agent, antigravity_plan
         from ..utils.antigravity_argv import AgyArgvError, agy_flag
 
+        mode = self._effective_mode()
         args = [
             "--input-format",
             "stream-json",
@@ -1592,8 +2264,12 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             "stream-json",
             "--print-timeout",
             "0",
-            "--disable-slash-commands",
         ]
+        if mode != "plan":
+            # C7: the flag turns ``--mode=plan`` into a no-op, so a plan run
+            # goes without it and escapes a ``/``-leading prompt instead
+            # (``stdin_payload``, D30).
+            args.append("--disable-slash-commands")
         if resume is not None:
             # #1039: agy's own continue flag also resumes a parent or child
             # directory's conversation, so it is never passed. ``run_impl``
@@ -1608,14 +2284,43 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         effort = self._effort_arg(model, state)
         if effort:
             args.append(agy_flag("--effort", effort))
-        # Phase 02 (D21): the bypass flag only for an explicit Full access.
-        # Ask me / Plan first never get here in rc1 (refused before spawn);
-        # anything else fails closed to Workspace.
-        mode = self._effective_mode()
-        if mode == "full":
+        # Phase 02 (D21) / phase 14: the bypass flag only as
+        # ``decide_antigravity_mode`` says — an explicit Full access, or Ask
+        # me with its gate ready (the decision ``run_impl`` made before
+        # spawn). Without one (a direct call), Ask me decides with no gate
+        # facts, which never bypasses. Plan first is agy's own plan mode
+        # under the no-shell agent (#981, shape A); anything else fails
+        # closed to Workspace.
+        decision = (
+            state.decision
+            if isinstance(state, AntigravityStreamState)
+            and state.decision is not None
+            and state.decision.mode == mode
+            else decide_antigravity_mode(mode)
+        )
+        if decision.gated and (
+            not isinstance(state, AntigravityStreamState)
+            or state.gate is None
+            or not state.gate.required
+        ):
+            # Invariant: Ask me's bypass only ever travels with this run's
+            # own required gate. Without it, fail closed.
+            logger.error("antigravity.gate.bypass_without_gate", mode=mode)
+            decision = decide_antigravity_mode(mode)
+        if decision.bypass:
+            # Full access and Ask me: agy's default agent (Ask me has
+            # nothing to ask about under the no-shell agent, G1) and no
+            # ``--mode`` (it takes one value, G2).
             args.append(BYPASS_FLAG)
         else:
-            args.append(agy_flag("--mode", WORKSPACE_AGY_MODE))
+            if mode == "ask":
+                # Refused before spawn; never reached by a real run. Fail
+                # closed to Workspace's flags all the same.
+                mode = "workspace"
+            agy_mode = (
+                antigravity_plan.PLAN_AGY_MODE if mode == "plan" else WORKSPACE_AGY_MODE
+            )
+            args.append(agy_flag("--mode", agy_mode))
             # #1037: Workspace runs use Untether's no-shell agent, so the
             # model has no shell tool to open with (a soft-denied shell call
             # ends the turn). Skipped when the file can't be put in place, or
@@ -1671,6 +2376,24 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         *,
         state: Any,
     ) -> bytes | None:
+        if isinstance(state, AntigravityStreamState) and state.effective_mode == "plan":
+            from ..utils import antigravity_plan
+
+            prompt = antigravity_plan.escape_slash(prompt)
+        if isinstance(state, AntigravityStreamState):
+            from ..utils import antigravity_agent
+
+            note = antigravity_agent.scheduled_run_note(
+                state.unattended, state.effective_mode
+            )
+            if note is not None:
+                # #1055: the model can't otherwise tell a cron from a chat.
+                prompt = f"{note}\n\n{prompt}"
+                logger.info(
+                    "antigravity.prompt.scheduled_note",
+                    trigger=state.unattended,
+                    permission_mode=state.effective_mode,
+                )
         line = {"event": "user", "message": {"content": prompt}}
         return (json.dumps(line, ensure_ascii=False) + "\n").encode()
 
@@ -1687,7 +2410,67 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             extra_allow=(*user_exact, *_AGY_ENV_EXTRAS), extra_prefix=user_prefix
         )
         env.setdefault("NO_COLOR", "1")
+        # #980 (D22): the gate's marker, socket and token reach agy only from
+        # this run's own gate — never inherited from Untether's environment
+        # (the ``UNTETHER_`` prefix would otherwise pass them through).
+        from ..antigravity import gate_hook
+
+        for key in [k for k in env if k.startswith(gate_hook.ENV_MARKER)]:
+            del env[key]
+        gate = getattr(state, "gate", None)
+        if gate is not None:
+            env.update(gate.env())
         return env
+
+    async def _iter_jsonl_events(
+        self,
+        *,
+        stdout: Any,
+        stream: Any,
+        state: Any,
+        resume: ResumeToken | None,
+        logger: Any,
+        pid: int,
+    ) -> AsyncIterator[UntetherEvent]:
+        """#980: with a gate, merge the events its socket raises (question
+        cards and their answers) into agy's own stream, and serve the socket
+        and the tripwire for as long as agy's stdout is read."""
+        base = JsonlSubprocessRunner._iter_jsonl_events(
+            self,
+            stdout=stdout,
+            stream=stream,
+            state=state,
+            resume=resume,
+            logger=logger,
+            pid=pid,
+        )
+        gate = getattr(state, "gate", None)
+        if gate is None:
+            async with contextlib.aclosing(base) as events:
+                async for evt in events:
+                    yield evt
+            return
+        gate.on_fatal = lambda kind: self._gate_kill(state, kind)
+        gate.on_approval_wait = state.note_approval_wait  # #1080
+        # Security review 3 L1: hook connections must come from below agy.
+        gate.agy_pid = pid
+        send, receive = anyio.create_memory_object_stream[UntetherEvent](64)
+
+        async def pump() -> None:
+            async with send, contextlib.aclosing(base) as events:
+                async for evt in events:
+                    await send.send(evt)
+            # agy's stream is over: nothing the gate raises now has a reader.
+            gate.stop_emitting()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(gate.serve, send.clone())
+            tg.start_soon(gate.watch)
+            tg.start_soon(pump)
+            async with receive:
+                async for evt in receive:
+                    yield evt
+            tg.cancel_scope.cancel()
 
     def new_state(
         self, prompt: str, resume: ResumeToken | None
@@ -1702,11 +2485,26 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         options = get_run_options()
         mode = self._effective_mode()
         label = _mode_label(mode)
+        approved, superseded = self._plan_bookkeeping(mode, prompt, expected)
+        if approved is not None:
+            label += " · plan approved"
         if precheck is not None:
             label += precheck.label_suffix
             precheck.effective_mode = mode
+        factory = EventFactory(ENGINE)
+        gate = _GATE.get()
+        if gate is not None:
+            gate.factory = factory
+        decision = _DECISION.get()
+        if decision is None or decision.mode != mode:
+            # A test driving ``translate`` / ``build_args`` without
+            # ``run_impl``: decide without gate facts (Ask me then never
+            # gets the bypass flag).
+            decision = decide_antigravity_mode(mode)
         return AntigravityStreamState(
-            factory=EventFactory(ENGINE),
+            factory=factory,
+            gate=gate,
+            decision=decision,
             expected_resume=expected or None,
             from_continue=from_continue,
             resumed=resume is not None,
@@ -1723,7 +2521,34 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 else None
             ),
             trigger_source=get_run_trigger_source(),
+            approved_plan=approved,
+            superseded_cards=superseded,
         )
+
+    @staticmethod
+    def _plan_bookkeeping(
+        mode: str, prompt: str, conversation_id: str | None
+    ) -> tuple[str | None, list[str]]:
+        """#981, at the start of a run on a known conversation: a new plan
+        turn retires the conversation's older plan cards (their ids, for the
+        bridge to take their buttons off, #1074); the run an Approve queued
+        (Workspace, Untether's approve prompt) takes the approval and returns
+        the plan's file name for the footer and the final."""
+        if conversation_id is None:
+            return None, []
+        from ..utils import antigravity_plan
+
+        if mode == "plan":
+            superseded = antigravity_plan.supersede(conversation_id)
+            if superseded:
+                logger.info("antigravity.plan.superseded", session_id=conversation_id)
+            return None, superseded
+        if mode != "workspace" or not prompt.rstrip().endswith(
+            antigravity_plan.APPROVE_PROMPT
+        ):
+            return None, []
+        plan = antigravity_plan.take_approved(conversation_id)
+        return (plan.name if plan is not None else None), []
 
     def start_run(
         self,
@@ -1788,6 +2613,16 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             )
         if getattr(proc, "returncode", None) is None:
             self.kill_with_escalation(proc)
+
+    def _gate_kill(self, state: AntigravityStreamState, kind: str) -> None:
+        """13 §7: a gated run whose hooks aren't reaching Untether."""
+        if state.kill_reason is not None or state.permission_refused:
+            return
+        state.kill_reason = kind
+        state.kill_detected_at = time.monotonic()
+        if state.agy_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(state.agy_pid, signal.SIGTERM)
 
     def _note_stderr_once(
         self, state: AntigravityStreamState, event: str, text: str
@@ -2005,6 +2840,8 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if state.expected_resume and cid != state.expected_resume:
             return self._conversation_gone(state, cid)
         state.session_id = cid
+        if state.gate is not None:
+            state.gate.set_conversation(cid)
         logger.info(
             "antigravity.session.started",
             session_id=cid,
@@ -2012,10 +2849,13 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             agy_version=state.agy_version,
         )
         token = ResumeToken(engine=ENGINE, value=cid)
+        meta = self._meta(state)
+        # #1058: the title is /export's "Model:" line — the model agy ran
+        # (``--model`` / ``init.model``), never the engine id. With neither,
+        # agy picked its own default and the stream doesn't say which.
+        title = str(meta.get("model") or DEFAULT_MODEL_TITLE)
         return [
-            state.factory.started(
-                token, title=self.session_title, meta=self._meta(state)
-            ),
+            state.factory.started(token, title=title, meta=meta),
             *self._startup_rows(state),
         ]
 
@@ -2040,9 +2880,31 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         two is missing the run goes on with a ⚠️ row."""
         state.permission_checked = True
         state.permission_note = None
-        if state.effective_mode == "full":
-            if reported == "request-review":
+        decision = state.decision
+        bypass = (
+            decision.bypass if decision is not None else state.effective_mode == "full"
+        )
+        if bypass:
+            # We passed the bypass flag (Full access, Ask me): agy reports
+            # always-proceed. A stricter value only means agy's own checks
+            # also apply (harmless; warned once). In Ask me anything else is
+            # a mode Untether didn't ask for: stop (D22.7).
+            if reported in _WORKSPACE_TOOL_PERMISSIONS:
                 _warn_bypass_unreported()
+            elif (
+                state.effective_mode == "ask"
+                and reported is not None
+                and reported != BYPASS_REPORTED
+            ):
+                logger.error(
+                    "antigravity.permission_mode.mismatch",
+                    source="init",
+                    requested="ask",
+                    reported=reported,
+                )
+                return self._refuse_in_stream(
+                    state, resume, ask_mode_mismatch_message(reported)
+                )
             return None
         if reported is not None and reported not in _WORKSPACE_TOOL_PERMISSIONS:
             logger.error(
@@ -2148,17 +3010,25 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             )
             if recorded:
                 self._seen().set(scan.root, scan.agy_digest)
-            out.append(
-                self._warning_row(
-                    state,
-                    "antigravity.config.present",
-                    "⚠️ This project has agy hooks, plugins or MCP servers that "
-                    f"Untether doesn't manage ({_paths_text(paths)}). They run "
-                    "their own commands in every mode, including Workspace. "
-                    "Review them if you didn't add them.",
-                    {"paths": paths},
+            if pre.gate_plugin_row:
+                # #1083: Untether's own plugin folder has its own row.
+                paths = [
+                    p
+                    for p in paths
+                    if not p.startswith(antigravity_scan.GATE_PLUGIN_DISPLAY_PREFIX)
+                ]
+            if paths:
+                out.append(
+                    self._warning_row(
+                        state,
+                        "antigravity.config.present",
+                        "⚠️ This project has agy hooks, plugins or MCP servers "
+                        f"that Untether doesn't manage ({_paths_text(paths)}). "
+                        "They run their own commands in every mode, including "
+                        "Workspace. Review them if you didn't add them.",
+                        {"paths": paths},
+                    )
                 )
-            )
         if pre.config_rows:
             out.extend(
                 self._warning_row(state, action_id, title)
@@ -2214,8 +3084,21 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         terminal = st in {"DONE", "ERROR"}
         if idx is not None and step_type in {"tool", "subagent", "agent_response"}:
             self._note_overtaken(state, idx)
+        if state.gate is not None:
+            out.extend(self._gate_step(su, state))
 
         if step_type == "tool":
+            if st == "DONE" and state.effective_mode == "plan":
+                # #981: the plan artifact is a finished write into the
+                # conversation's own folder (resolved at the result).
+                from ..utils import antigravity_plan
+
+                info = su.tool_info
+                antigravity_plan.note_plan_write(
+                    state.plan_writes,
+                    su.tool_name or (info.name if info and info.name else ""),
+                    info.parameters if info is not None else None,
+                )
             out.extend(self._translate_tool(su, state, action_id))
             return out
         if step_type == "subagent":
@@ -2253,6 +3136,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     state.text_by_step.get(idx, "") + su.text_delta
                 )
             if st == "DONE":
+                _add_run_tokens(state.run_tokens, su.usage)
                 out.extend(self._note_context(su.usage, state))
             return out
         # A tool step that turns into another type on completion (the
@@ -2262,7 +3146,9 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             action = state.pending_actions.pop(action_id)
             if idx is not None:
                 state.bg_steps.pop(idx, None)
-                self._task_step_ended(state, idx, ok=st == "DONE")
+                self._task_step_ended(
+                    state, idx, status="completed" if st == "DONE" else "failed"
+                )
             out.append(self._complete(action, state, ok=st == "DONE"))
             return out
         if step_type == "system_message" and terminal:
@@ -2271,6 +3157,86 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # checkpoint, unknown, finish, anything newer.
         logger.debug("antigravity.step.ignored", step_type=step_type, state=st)
         return out
+
+    # -- gate (#980, #981) ---------------------------------------------------
+
+    def _gate_step(
+        self, su: agy_schema.StepUpdatePayload, state: AntigravityStreamState
+    ) -> list[UntetherEvent]:
+        """Liveness, tripwire bookkeeping and steer delivery for one step."""
+        gate = state.gate
+        step_type = su.step_type
+        idx = su.step_index
+        if (
+            step_type in _MODEL_STEP_TYPES
+            and not gate.preinvocation_seen
+            and not gate.dead
+        ):
+            # 13 §7.1: ``PreInvocation`` fires before every model call, so a
+            # model step with none before it means the hooks don't run.
+            gate.mark_dead()
+            if gate.required:
+                logger.error(
+                    "antigravity.gate.not_running",
+                    session_id=state.session_id,
+                    step_type=step_type,
+                )
+                self._gate_kill(state, "gate_not_running")
+            elif not state.gate_liveness_logged:
+                state.gate_liveness_logged = True
+                logger.warning(
+                    "antigravity.gate.not_running",
+                    session_id=state.session_id,
+                    step_type=step_type,
+                    enforced=False,
+                )
+        if step_type == "tool" and su.state == "ACTIVE" and idx is not None:
+            if not gate.dead:
+                info = su.tool_info
+                gate.note_tool_step(
+                    idx, su.tool_name or (info.name if info and info.name else "tool")
+                )
+            return []
+        if (
+            step_type == "user_input"
+            and su.state in {"DONE", "ERROR"}
+            and idx is not None
+            and idx > 0
+        ):
+            item = gate.take_delivered()
+            if item is not None:
+                return self._steer_received(state, idx, item)
+        return []
+
+    @staticmethod
+    def _steer_received(
+        state: AntigravityStreamState, idx: int, item: Any
+    ) -> list[UntetherEvent]:
+        """P-H10: one ``user_input`` step per injected message. The bridge
+        drops the message's reply anchor on ``absorbed_command_uuid`` (its
+        answer is this turn's answer), as for a Claude steer (#775)."""
+        logger.info(
+            "antigravity.steer.delivered",
+            step=idx,
+            session_id=state.session_id,
+            command_uuid=item.command_uuid,
+        )
+        snippet = " ".join(item.text.split())
+        if len(snippet) > _STEER_SNIPPET_CHARS:
+            snippet = snippet[: _STEER_SNIPPET_CHARS - 1] + "…"
+        title = f"\N{RIGHTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16} steer received: {snippet}"
+        state.note_seq += 1
+        action_id = f"antigravity.steer.{state.note_seq}"
+        detail = {"absorbed_command_uuid": item.command_uuid, "steer": True}
+        factory = state.factory
+        return [
+            factory.action_started(
+                action_id=action_id, kind="note", title=title, detail=detail
+            ),
+            factory.action_completed(
+                action_id=action_id, kind="note", title=title, ok=True, detail=detail
+            ),
+        ]
 
     # -- context use (#979) ---------------------------------------------------
 
@@ -2382,9 +3348,16 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     action_id=action_id, kind=kind, title=title, detail=detail
                 )
             ]
+        err = info.error if info is not None else None
+        # #1062: a step agy stopped (``manage_task`` kill) ends DONE but
+        # carries ``tool_info.error`` ("context canceled", agy 1.3.3).
+        failed = su.state == "ERROR" or (
+            err is not None and bool(err.message or err.type)
+        )
+        end_status = _task_end_status(failed, err)
         if idx is not None:
             state.bg_steps.pop(idx, None)
-            self._task_step_ended(state, idx, ok=su.state == "DONE")
+            self._task_step_ended(state, idx, status=end_status)
             if su.state == "ERROR":
                 self._track_subagents(state, idx, [], failed=True)
         if tool_name == "run_command":
@@ -2399,14 +3372,17 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 title=title,
                 detail={"tool_name": tool_name, "input": params},
             )
-        if su.state == "ERROR":
-            err = info.error if info is not None else None
-            message = (err.message if err and err.message else "tool failed")[
-                :_ERROR_MESSAGE_CHARS
-            ]
+        if failed:
+            message = _gate_block_text(
+                err.message if err and err.message else "tool failed"
+            )[:_ERROR_MESSAGE_CHARS]
             detail = dict(action.detail)
             if err is not None and err.type:
                 detail["error_type"] = err.type
+            if end_status == "stopped":
+                # #1062: a step agy stopped (a ``manage_task`` kill) reads
+                # ⏹️ on its row, not ✗; the ⏳ block lists only live tasks.
+                detail["stopped"] = True
             action = Action(
                 id=action.id, kind=action.kind, title=action.title, detail=detail
             )
@@ -2511,6 +3487,52 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             logger.info("antigravity.background.started", task_id=f"timer:{idx}")
         elif tool_name == "invoke_subagent":
             self._track_subagents(state, idx, _subagent_specs(params, None))
+        elif tool_name == "manage_task" and params.get("Action") == "kill":
+            self._task_killed(state, params.get("TaskId"))
+        if idx in state.approval_steps:
+            # #1080: the card came before the step's ACTIVE line.
+            state.note_approval_wait(idx, True)
+
+    @staticmethod
+    def _task_killed(state: AntigravityStreamState, task_id: Any) -> None:
+        """#1062: agy's ``manage_task`` kill names the task as
+        ``<conversation>/task-<step>``. Only a task in the background can be
+        killed, so a command or timer still running ends as stopped and is
+        listed even if its wait hadn't passed; one its own cancelled DONE
+        already closed keeps that status — or is listed now, if that DONE
+        came before the background threshold (the kill's own DONE arrives
+        with it, so a fast kill beats the 5 s default; rc4 QA on 1.3.4).
+        agy sends a ``system_message`` for the kill (1.3.3 and 1.3.4), so
+        one notice is owed."""
+        match = _KILLED_TASK_RE.search(task_id) if isinstance(task_id, str) else None
+        if match is None:
+            return
+        step = match.group(1)
+        for key in (f"cmd:{step}", f"timer:{step}"):
+            task = state.tasks.get(key)
+            if task is None:
+                task = state.cancelled_steps.pop(key, None)
+                if task is None:
+                    continue
+                task.background_from = None
+                AntigravityRunner._add_task(state, task)
+            elif task.status == "stopped":
+                state.bg_notices_owed += 1
+                continue
+            elif task.status != "running":
+                continue
+            else:
+                task.background_from = None
+                task.status = "stopped"
+                task.ended_at = time.monotonic()
+            state.bg_notices_owed += 1
+            logger.info(
+                "antigravity.background.finished",
+                task_id=key,
+                status="stopped",
+                elapsed_s=round((task.ended_at or 0.0) - task.started_at, 1),
+                source="manage_task",
+            )
 
     def _track_subagents(
         self,
@@ -2540,6 +3562,10 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 logger.info("antigravity.background.started", task_id=key)
             if task is not None and child:
                 task.ref = child
+            if child and state.gate is not None:
+                # P-H8: a child's tool calls reach the gate with its own id;
+                # Ask me's approval card names the child by its role.
+                state.gate.add_children([child], role=role or type_name or None)
         if failed:
             prefix = f"sub:{idx}:"
             for key, task in state.tasks.items():
@@ -2557,22 +3583,36 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             if step >= idx:
                 continue
             task = state.tasks.get(f"cmd:{step}")
-            if task is not None and not task.is_backgrounded:
+            if (
+                task is not None
+                and not task.is_backgrounded
+                and step not in state.approval_steps  # #1080
+            ):
                 task.background_from = None
 
     @staticmethod
-    def _task_step_ended(state: AntigravityStreamState, idx: int, *, ok: bool) -> None:
-        """The ``run_command`` / ``schedule`` step *idx* reached DONE / ERROR."""
+    def _task_step_ended(
+        state: AntigravityStreamState, idx: int, *, status: str
+    ) -> None:
+        """The ``run_command`` / ``schedule`` step *idx* reached DONE / ERROR
+        (``completed``, ``failed``, or ``stopped`` when agy killed it)."""
         for key in (f"cmd:{idx}", f"timer:{idx}"):
             task = state.tasks.get(key)
             if task is None or task.status != "running":
                 continue
             if not task.is_backgrounded:
                 del state.tasks[key]  # finished in the foreground: never a row
+                if status == "stopped" and len(state.cancelled_steps) < _TASKS_MAX:
+                    # #1062: unless a ``manage_task`` kill names it next.
+                    task.status = status
+                    task.ended_at = time.monotonic()
+                    state.cancelled_steps[key] = task
                 continue
-            task.status = "completed" if ok else "failed"
+            task.status = status
             task.ended_at = time.monotonic()
-            state.bg_notices_owed += 1
+            if status != "stopped":
+                # A kill's notice is owed by the kill (``_task_killed``).
+                state.bg_notices_owed += 1
             logger.info(
                 "antigravity.background.finished",
                 task_id=key,
@@ -2615,6 +3655,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             state.tasks[key].status = "ended"
             state.tasks[key].ended_at = now
         state.bg_notices_owed = 0
+        state.cancelled_steps.clear()
         outlived = [key for key in left if key.startswith("cmd:")]
         if ok and outlived:
             logger.info("antigravity.background.outlived", tasks=outlived)
@@ -2707,6 +3748,90 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             state.text_by_step[i].rstrip("\n") for i in sorted(state.text_by_step)
         )
 
+    def _plan_review(
+        self,
+        state: AntigravityStreamState,
+        answer: str,
+        usage: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """#981: a finished Plan first turn → the plan in the final, plus the
+        Approve / Deny / Let's discuss card (``usage[REVIEW_CARD_KEY]``, sent
+        by the bridge right after the final). Unattended runs (#835) post the
+        plan and change nothing: no card, a 🔒 footer instead. A turn that
+        wrote no plan is an ordinary answer with a one-line note."""
+        from ..utils import antigravity_plan
+        from ..utils.paths import (
+            get_run_context,
+            get_run_sender_id,
+            get_run_thread_id,
+        )
+
+        plan = antigravity_plan.find_plan(state.session_id, state.plan_writes)
+        if plan is None:
+            logger.info(
+                "antigravity.plan.no_artifact",
+                session_id=state.session_id,
+                writes=len(state.plan_writes),
+                trigger=state.unattended,
+            )
+            if state.unattended is None:
+                answer = _append_paragraph(answer, antigravity_plan.NO_PLAN_NOTE)
+            return answer, usage
+        answer = antigravity_plan.plan_answer(plan, answer)
+        logger.info(
+            "antigravity.plan.detected",
+            session_id=state.session_id,
+            name=plan.name,
+            chars=len(plan.body),
+            truncated=plan.truncated,
+            trigger=state.unattended,
+        )
+        if state.unattended is not None:
+            label = antigravity_plan.UNATTENDED_DENIED_LABEL
+            logger.warning(
+                "permission.unattended_deny",
+                tool_name=label,
+                trigger_source=state.unattended,
+                session_id=state.session_id,
+                permission_mode="plan",
+                reason="plan_mode",
+            )
+            usage = {
+                **usage,
+                "unattended": {
+                    "trigger": state.unattended,
+                    "mode": "plan",
+                    "denied": {label: 1},
+                    "hint": antigravity_plan.unattended_hint(state.unattended),
+                },
+            }
+            return answer, usage
+        base = get_run_base_dir()
+        pending = antigravity_plan.register(
+            conversation_id=state.session_id or "",
+            name=plan.name,
+            channel_id=get_run_channel_id(),
+            thread_id=get_run_thread_id(),
+            context=get_run_context(),
+            cwd=str(base) if base is not None else None,
+            originator=get_run_sender_id(),
+        )
+        logger.info(
+            "antigravity.plan.card",
+            session_id=state.session_id,
+            request_id=pending.request_id,
+        )
+        state.superseded_cards.extend(pending.extra.get("superseded", ()))
+        usage = {
+            **usage,
+            REVIEW_CARD_KEY: {
+                "id": pending.request_id,
+                "text": antigravity_plan.card_text(plan.name),
+                "buttons": antigravity_plan.keyboard(pending.request_id),
+            },
+        }
+        return answer, usage
+
     def _resume_for_completed(
         self, state: AntigravityStreamState, resume: ResumeToken | None
     ) -> ResumeToken | None:
@@ -2728,6 +3853,11 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             if state.conversation_missing:
                 return out
         state.result_seen = True
+        if state.gate is not None:
+            # Nothing is injected after the result; a steer still queued (or
+            # injected but never seen) is reported by the bridge's run-end
+            # sweep ("send it again").
+            state.gate.note_result()
         status = res.status or ""
         error = _error_text(res.error)
         failure = self._failure_text(state, error) if status != "SUCCESS" else None
@@ -2763,7 +3893,10 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             answer = _append_paragraph(
                 answer,
                 denial_paragraph(
-                    denied_labels, mode=state.effective_mode, trigger=state.unattended
+                    denied_labels,
+                    mode=state.effective_mode,
+                    trigger=state.unattended,
+                    kept_shell=_kept_shell_agent(state, denied_labels),
                 ),
             )
         if status == "SUCCESS":
@@ -2773,6 +3906,19 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         usage = self._usage(res, state)
         self._log_timing(res, state)
         resume_token = self._resume_for_completed(state, resume)
+        if state.gate is not None and (gated := state.gate.unattended_usage()):
+            # #835 parity: an unattended Ask me run's gate denials → 🔒 footer.
+            usage = {**usage, "unattended": gated}
+        if status == "SUCCESS" and state.effective_mode == "plan":
+            answer, usage = self._plan_review(state, answer, usage)
+        elif status == "SUCCESS" and state.approved_plan is not None:
+            from ..utils import antigravity_plan
+
+            answer = _prepend_paragraph(
+                answer, antigravity_plan.approved_header(state.approved_plan)
+            )
+        if state.superseded_cards:
+            usage = _with_retired_cards(usage, state.superseded_cards)
         factory = state.factory
         if status == "SUCCESS":
             out.append(
@@ -2825,7 +3971,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         for item in denied:
             action = item.action or "unknown"
             display = item.display_name or action
-            label = _DENIED_LABEL.get(action, "tool")
+            label = _denied_label(action, state.effective_mode)
             family = _DENIED_FAMILY.get(action, frozenset())
             hits = [
                 action_id
@@ -2956,6 +4102,9 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 )
                 if isinstance(value, int)
             }
+        if state.run_tokens:
+            # #1062: the bridge's per-run figure (``_apply_token_delta``).
+            usage[RUN_TOKENS_KEY] = dict(state.run_tokens)
         if state.t_spawn:
             usage["duration_ms"] = int((time.monotonic() - state.t_spawn) * 1000)
         context = self._context_value(state)
@@ -3093,6 +4242,72 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         return out
 
 
+def _kept_shell_agent(state: AntigravityStreamState, labels: list[str]) -> bool:
+    """#1060: a shell command was denied on a resumed run that named
+    Untether's no-shell agent. That agent has no shell tool, so the
+    conversation is still on the agent it started with (agy 1.3.3 ignores
+    ``--agent`` on ``--conversation``; ``init.agent`` echoes the flag either
+    way, so the stream can't say so before the turn)."""
+    if not state.resumed or "shell command" not in labels:
+        return False
+    return any(arg.startswith("--agent=") for arg in state.argv or ())
+
+
+# agy's error on a tool its PreToolUse hook denied (E2, agy 1.3.3).
+_HOOK_DENIED_PREFIX = "tool call denied by pre-tool hook:"
+
+
+def _gate_block_text(message: str) -> str:
+    """#980: a tool Untether's gate blocked reads as that, not as agy's
+    error plus the long reason meant for the model."""
+    if not message.startswith(_HOOK_DENIED_PREFIX):
+        return message
+    from ..antigravity import gate_server
+
+    reason = message[len(_HOOK_DENIED_PREFIX) :].strip()
+    if reason.startswith(gate_server.DENY_TEXT[:40]):
+        return "blocked: denied in Telegram"
+    if reason.startswith("No answer in Telegram within"):
+        return "blocked: no answer in Telegram in time"
+    if reason.startswith("Untether: this is an unattended"):
+        return "blocked: unattended run, nobody to approve"
+    # Another hook's reason (or a question's answer): agy's own words.
+    return message
+
+
+def _add_run_tokens(totals: dict[str, int], usage: agy_schema.StepUsage | None) -> None:
+    """#1062: add one model call's usage to the run's own totals, under the
+    names ``_usage`` gives the result's."""
+    if usage is None:
+        return
+    for key, value in (
+        ("input_tokens", usage.input_tokens),
+        ("output_tokens", usage.output_tokens),
+        ("cache_read_tokens", usage.cache_read_tokens),
+        ("reasoning_tokens", usage.thinking_tokens),
+    ):
+        if _is_count(value):
+            totals[key] = totals.get(key, 0) + value
+
+
+def _with_retired_cards(usage: dict[str, Any], ids: list[str]) -> dict[str, Any]:
+    """#1074: the replaced plan cards still showing buttons, for the bridge
+    to edit (``usage[RETIRED_CARDS_KEY]``)."""
+    from ..utils import antigravity_plan
+
+    retired = antigravity_plan.retire(ids)
+    return {**usage, RETIRED_CARDS_KEY: retired} if retired else usage
+
+
+def _task_end_status(failed: bool, err: agy_schema.ToolError | None) -> str:
+    """#1062: how a background task's step ended. agy reports a task it
+    killed itself (``manage_task``) as DONE with a cancellation error."""
+    if not failed:
+        return "completed"
+    message = (err.message or "") if err is not None else ""
+    return "stopped" if _CANCELLED_RE.search(message) else "failed"
+
+
 def _step_of(action_id: str) -> int:
     try:
         return int(action_id.removeprefix("step-"))
@@ -3149,6 +4364,12 @@ def _append_paragraph(answer: str, paragraph: str) -> str:
     return f"{answer.rstrip()}\n\n{paragraph}"
 
 
+def _prepend_paragraph(answer: str, paragraph: str) -> str:
+    if not answer.strip():
+        return paragraph
+    return f"{paragraph}\n\n{answer.lstrip()}"
+
+
 # ── #1045: ⚠️ rows in the final answer ──────────────────────────────────────
 
 
@@ -3170,12 +4391,30 @@ def _note_warning(titles: list[str], evt: UntetherEvent) -> None:
         titles.append(title)
 
 
+# #1083: an Untether command a row names as code (`untether agy-gate status`).
+_UNTETHER_COMMAND_SPAN = re.compile(r"`(untether [^`\n]+)`")
+
+
+def _escape_keeping_commands(line: str) -> str:
+    """Escaped, except the ``untether …`` commands a row writes as code,
+    which stay code spans (as in the progress row and the 🔐 page) rather
+    than showing their backticks."""
+    out: list[str] = []
+    pos = 0
+    for match in _UNTETHER_COMMAND_SPAN.finditer(line):
+        out.append(escape_markdown(line[pos : match.start()]))
+        out.append(inline_code(match.group(1)))
+        pos = match.end()
+    out.append(escape_markdown(line[pos:]))
+    return "".join(out)
+
+
 def final_warning_block(titles: list[str]) -> str | None:
     """One line per distinct row, escaped: the rows carry project paths."""
     lines = list(dict.fromkeys(t for t in titles if t))
     if not lines:
         return None
-    return HARD_BREAK.join(escape_markdown(line) for line in lines)
+    return HARD_BREAK.join(_escape_keeping_commands(line) for line in lines)
 
 
 def _with_warning_block(evt: CompletedEvent, titles: list[str]) -> CompletedEvent:
@@ -3192,9 +4431,11 @@ def _with_warning_block(evt: CompletedEvent, titles: list[str]) -> CompletedEven
 def build_runner(config: EngineConfig, config_path: Path) -> Runner:
     """Build an ``AntigravityRunner`` from ``[antigravity]`` config.
 
-    rc1 keys: ``model`` (str), ``cmd`` (str, ``~`` expanded) and
+    Keys: ``model`` (str), ``cmd`` (str, ``~`` expanded),
     ``permission_mode`` (``workspace`` / ``ask`` / ``plan`` / ``full``,
-    validated here; ``full`` warns once). Unknown keys — including PR #766's
+    validated here; ``full`` warns once) and ``approval_timeout_s`` (#980:
+    Ask me's approval wait, 60-3000 s, capped by the gate plugin's own
+    wait). Unknown keys — including PR #766's
     ``dangerously_skip_permissions`` / ``antigravity_cmd`` — are ignored.
     """
     model = config.get("model")
@@ -3249,12 +4490,32 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
         )
     if mode == "full":
         _warn_full_access_from_toml(config_path)
+    timeout = config.get("approval_timeout_s")
+    if timeout is not None:
+        from ..antigravity import gate_plugin
+
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not gate_plugin.MIN_WAIT_S <= timeout <= gate_plugin.MAX_WAIT_S
+        ):
+            logger.warning(
+                "antigravity.config.invalid",
+                error="approval_timeout_s out of range",
+                config_path=str(config_path),
+            )
+            raise ConfigError(
+                f"Invalid `antigravity.approval_timeout_s` in {config_path}; "
+                f"expected whole seconds from {gate_plugin.MIN_WAIT_S} to "
+                f"{gate_plugin.MAX_WAIT_S}."
+            )
     cmd = os.path.expanduser(raw_cmd) if raw_cmd else default_antigravity_cmd()
     return AntigravityRunner(
         antigravity_cmd=cmd,
         model=model or None,
         default_permission_mode=mode,
         config_path=config_path,
+        approval_timeout_s=timeout,
     )
 
 
