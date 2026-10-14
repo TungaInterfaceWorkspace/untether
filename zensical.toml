@@ -7,6 +7,9 @@ repo_url = "https://github.com/littlebearapps/untether"
 repo_name = "littlebearapps/untether"
 edit_uri = "edit/master/docs/"
 docs_dir = "docs"
+exclude_docs = """
+reference/dev-instance.md
+"""
 site_dir = "_site"
 extra_css = ["stylesheets/admonitions.css", "stylesheets/workflow-preview.css", "stylesheets/hero-chat.css"]
 extra_javascript = ["javascripts/hero-chat.js"]
@@ -73,7 +76,6 @@ nav = [
     { "Glossary" = "reference/glossary.md" },
     { "Context resolution" = "reference/context-resolution.md" },
     { "Triggers" = "reference/triggers/triggers.md" },
-    { "Dev instance" = "reference/dev-instance.md" },
     { "Telegram transport" = "reference/transports/telegram.md" },
     { "Runners" = [
       { "Overview" = "reference/runners/index.md" },
